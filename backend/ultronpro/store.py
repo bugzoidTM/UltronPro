@@ -433,6 +433,7 @@ class Store:
                     title = first_line
 
                 # insert/merge into laws (avoid nested connections)
+                now = _ts()
                 row2 = c.execute(
                     "SELECT id FROM laws WHERE text=? AND status='active' ORDER BY id DESC LIMIT 1",
                     (text,),
