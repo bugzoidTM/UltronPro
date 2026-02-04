@@ -61,6 +61,12 @@
     <div id="cmsg" class="muted" style="margin-top:8px"></div>
   </div>
 
+  <div class="card" style="margin-top:12px">
+    <h3>Feed de Aprendizado</h3>
+    <div class="muted">Eventos recentes (novas triplas, leis, conflitos resolvidos). Polling a cada 2s.</div>
+    <pre id="feed" class="muted" style="max-height:240px;overflow:auto">...</pre>
+  </div>
+
 <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
 <script>
 async function jfetch(url, opts){
@@ -326,9 +332,35 @@ document.getElementById('skip').onclick = async () => {
   }catch(e){setMsg('❌ '+e.message)}
 };
 
+let lastEventId=0;
+async function feedTick(){
+  try{
+    const j = await jfetch('/api/events?since_id='+lastEventId+'&limit=50');
+    const ev = j.events || [];
+    if(ev.length){
+      lastEventId = Math.max(lastEventId, ...ev.map(e=>e.id||0));
+      const box = document.getElementById('feed');
+      const existing = box.textContent==='...' ? '' : box.textContent;
+      const lines = ev.map(e=>{
+        const ts = new Date((e.created_at||0)*1000).toLocaleTimeString();
+        return `[${ts}] ${e.kind}: ${e.text}`;
+      }).join('\n');
+      box.textContent = (existing ? (existing+'\n') : '') + lines;
+      // keep last ~200 lines
+      const arr = box.textContent.split('\n');
+      if(arr.length>200) box.textContent = arr.slice(arr.length-200).join('\n');
+      box.scrollTop = box.scrollHeight;
+    }
+  }catch(e){
+    document.getElementById('feed').textContent = 'feed error: '+e.message;
+  }
+}
+
 load();
 setInterval(graphTick, 2000);
+setInterval(feedTick, 2000);
 graphTick();
+feedTick();
 </script>
 </body>
 </html>

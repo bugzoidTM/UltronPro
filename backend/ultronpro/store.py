@@ -67,10 +67,22 @@ class Store:
                   created_at REAL NOT NULL,
                   updated_at REAL,
                   status TEXT NOT NULL, -- active|archived
+                  core INTEGER NOT NULL DEFAULT 1,
                   title TEXT,
                   text TEXT NOT NULL,
                   source_id TEXT,
                   source_experience_id INTEGER
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS events(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  created_at REAL NOT NULL,
+                  kind TEXT NOT NULL,
+                  text TEXT NOT NULL,
+                  meta_json TEXT
                 )
                 """
             )
@@ -198,6 +210,11 @@ class Store:
             # migrations for laws
             if c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='laws'").fetchone():
                 law_cols = {r[1] for r in c.execute("PRAGMA table_info(laws)").fetchall()}
+                if "core" not in law_cols:
+                    try:
+                        c.execute("ALTER TABLE laws ADD COLUMN core INTEGER NOT NULL DEFAULT 1")
+                    except Exception:
+                        pass
                 if "source_experience_id" not in law_cols:
                     try:
                         c.execute("ALTER TABLE laws ADD COLUMN source_experience_id INTEGER")
@@ -396,10 +413,18 @@ class Store:
                 return int(row[0])
 
             cur = c.execute(
-                "INSERT INTO laws(created_at,updated_at,status,title,text,source_id,source_experience_id) VALUES(?,?,?,?,?,?,?)",
-                (now, now, 'active', title, text, source_id, source_experience_id),
+                "INSERT INTO laws(created_at,updated_at,status,core,title,text,source_id,source_experience_id) VALUES(?,?,?,?,?,?,?,?)",
+                (now, now, 'active', 1, title, text, source_id, source_experience_id),
             )
-            return int(cur.lastrowid)
+            lid = int(cur.lastrowid)
+            try:
+                c.execute(
+                    "INSERT INTO events(created_at, kind, text, meta_json) VALUES(?,?,?,?)",
+                    (now, 'law_new', f"+1 lei: {(title or 'Lei').strip()}", None),
+                )
+            except Exception:
+                pass
+            return lid
 
     def migrate_text_experiences_to_laws(self, limit: int = 200) -> dict[str, Any]:
         """Heuristically promote old text experiences into 'law' modality + laws table.
@@ -492,6 +517,30 @@ class Store:
         now = _ts()
         with self._conn() as c:
             c.execute("UPDATE laws SET status='archived', updated_at=? WHERE id=?", (now, int(law_id)))
+
+    # --- events
+    def add_event(self, kind: str, text: str, meta_json: str | None = None) -> int:
+        now = _ts()
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO events(created_at, kind, text, meta_json) VALUES(?,?,?,?)",
+                (now, kind, (text or '')[:2000], meta_json),
+            )
+            return int(cur.lastrowid)
+
+    def list_events(self, since_id: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, created_at, kind, text, meta_json
+                FROM events
+                WHERE id > ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (int(since_id), int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # --- actions
     def enqueue_action(self, kind: str, text: str, priority: int = 0, meta_json: str | None = None) -> int:
@@ -779,6 +828,7 @@ class Store:
                 SELECT subject, predicate, COUNT(DISTINCT object) as n
                 FROM triples
                 WHERE confidence >= ?
+                  AND subject <> 'AGI' -- norms can have multiple objects; don't treat as contradiction
                 GROUP BY subject, predicate
                 HAVING n >= 2
                 ORDER BY n DESC
@@ -1050,7 +1100,7 @@ class Store:
                         contradicts=False,
                     )
 
-                    # optionally mark other variants as contradicted (soft)
+                    # optionally mark other variants as contradicted (and drop confidence below contradiction threshold)
                     others = [
                         str(r[0])
                         for r in c.execute(
@@ -1059,16 +1109,29 @@ class Store:
                         ).fetchall()
                     ]
                     for obj in others[:5]:
-                        self._add_or_reinforce_triple_conn(
-                            c,
-                            subject,
-                            predicate,
-                            obj,
-                            confidence=0.35,
-                            experience_id=eid,
-                            note=f"conflict_resolution_contradict:{cid}",
-                            contradicts=True,
+                        # ensure the losing variant won't keep re-triggering contradictions
+                        c.execute(
+                            """
+                            UPDATE triples
+                            SET confidence = MIN(confidence, 0.45),
+                                updated_at = ?,
+                                contradict_count = contradict_count + 1
+                            WHERE subject=? AND predicate=? AND object=?
+                            """,
+                            (now, subject, predicate, obj),
                         )
+                        c.execute(
+                            "INSERT INTO triple_evidence(triple_id, experience_id, note, created_at) SELECT id, ?, ?, ? FROM triples WHERE subject=? AND predicate=? AND object=? ORDER BY id DESC LIMIT 1",
+                            (eid, f"conflict_resolution_contradict:{cid}", now, subject, predicate, obj),
+                        )
+
+                    try:
+                        c.execute(
+                            "INSERT INTO events(created_at, kind, text, meta_json) VALUES(?,?,?,?)",
+                            (now, 'conflict_resolved', f"✅ conflito resolvido #{cid}: {subject} {predicate} -> {chosen_object}", None),
+                        )
+                    except Exception:
+                        pass
 
                     # governance: reward sources supporting chosen_object, penalize sources supporting other variants
                     chosen_tids = [

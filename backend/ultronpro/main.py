@@ -282,6 +282,11 @@ async def actions(limit: int = 50):
     return {"success": True, "actions": store.list_actions(limit=limit)}
 
 
+@app.get("/api/events")
+async def events(since_id: int = 0, limit: int = 100):
+    return {"success": True, "events": store.list_events(since_id=since_id, limit=limit)}
+
+
 @app.post("/api/laws/{law_id}/archive")
 async def archive_law(law_id: int):
     store.archive_law(law_id)
