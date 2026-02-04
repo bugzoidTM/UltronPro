@@ -977,7 +977,7 @@ class Store:
                 (now, resolution, int(cid)),
             )
 
-            # governance: reward sources supporting chosen_object, penalize sources supporting other variants
+            # consolidate learning into the graph (tutor -> evidence)
             if chosen_object:
                 conf = c.execute(
                     "SELECT subject, predicate FROM conflicts WHERE id=?",
@@ -985,7 +985,57 @@ class Store:
                 ).fetchone()
                 if conf:
                     subject, predicate = conf[0], conf[1]
-                    # find triple ids for chosen & other
+
+                    # create a dedicated experience for the resolution (evidence)
+                    src = None
+                    if decided_by:
+                        src = f"human:{decided_by.strip()[:80]}"
+                    else:
+                        src = "human:unknown"
+                    # ensure source exists
+                    try:
+                        self.ensure_source(src, kind="human", label=src)
+                    except Exception:
+                        pass
+
+                    exp_text = f"RESOLUÇÃO CONFLITO #{cid}: '{subject}' {predicate} -> '{chosen_object}'.\nJustificativa: {resolution or '(sem justificativa)'}"
+                    cur = c.execute(
+                        "INSERT INTO experiences(created_at, processed_at, user_id, source_id, modality, text, blob_path, mime) VALUES(?,?,?,?,?,?,?,?)",
+                        (now, now, None, src, "resolution", exp_text[:20000], None, "text/plain"),
+                    )
+                    eid = int(cur.lastrowid)
+
+                    # reinforce chosen triple with strong confidence and evidence link
+                    self.add_or_reinforce_triple(
+                        subject,
+                        predicate,
+                        chosen_object,
+                        confidence=0.85,
+                        experience_id=eid,
+                        note=f"conflict_resolution:{cid}",
+                        contradicts=False,
+                    )
+
+                    # optionally mark other variants as contradicted (soft)
+                    others = [
+                        str(r[0])
+                        for r in c.execute(
+                            "SELECT object FROM conflict_variants WHERE conflict_id=? AND object<>?",
+                            (int(cid), chosen_object),
+                        ).fetchall()
+                    ]
+                    for obj in others[:5]:
+                        self.add_or_reinforce_triple(
+                            subject,
+                            predicate,
+                            obj,
+                            confidence=0.35,
+                            experience_id=eid,
+                            note=f"conflict_resolution_contradict:{cid}",
+                            contradicts=True,
+                        )
+
+                    # governance: reward sources supporting chosen_object, penalize sources supporting other variants
                     chosen_tids = [
                         int(r[0])
                         for r in c.execute(
@@ -1018,21 +1068,21 @@ class Store:
                     chosen_srcs = sources_for_tids(chosen_tids)
                     other_srcs = sources_for_tids(other_tids)
 
-                    for src in chosen_srcs:
-                        self.ensure_source(src)
+                    for ssrc in chosen_srcs:
+                        self.ensure_source(ssrc)
                         c.execute(
                             "UPDATE sources SET support_count=support_count+1, updated_at=? WHERE id=?",
-                            (now, src),
+                            (now, ssrc),
                         )
-                        self._recompute_source_trust(c, src)
+                        self._recompute_source_trust(c, ssrc)
 
-                    for src in (other_srcs - chosen_srcs):
-                        self.ensure_source(src)
+                    for ssrc in (other_srcs - chosen_srcs):
+                        self.ensure_source(ssrc)
                         c.execute(
                             "UPDATE sources SET contradict_count=contradict_count+1, updated_at=? WHERE id=?",
-                            (now, src),
+                            (now, ssrc),
                         )
-                        self._recompute_source_trust(c, src)
+                        self._recompute_source_trust(c, ssrc)
 
     def archive_conflict(self, cid: int):
         now = _ts()
