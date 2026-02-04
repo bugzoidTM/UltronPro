@@ -592,8 +592,9 @@ class Store:
             c.execute("UPDATE questions SET status='dismissed' WHERE id=?", (qid,))
 
     # --- knowledge graph
-    def add_or_reinforce_triple(
+    def _add_or_reinforce_triple_conn(
         self,
+        c: sqlite3.Connection,
         subject: str,
         predicate: str,
         object_: str,
@@ -602,17 +603,12 @@ class Store:
         note: str | None = None,
         contradicts: bool = False,
     ) -> int:
-        """Upsert-ish triple.
-
-        - If (s,p,o) exists, increase support_count and update confidence.
-        - If contradicts=True, increase contradict_count instead.
-        """
         now = _ts()
         subject = subject.strip()
         predicate = predicate.strip()
         object_ = object_.strip()
-        with self._conn() as c:
-            row = c.execute(
+
+        row = c.execute(
                 "SELECT id, confidence, support_count, contradict_count FROM triples WHERE subject=? AND predicate=? AND object=? ORDER BY id DESC LIMIT 1",
                 (subject, predicate, object_),
             ).fetchone()
@@ -671,7 +667,34 @@ class Store:
                 except Exception:
                     pass
 
-            return tid
+        return tid
+
+    def add_or_reinforce_triple(
+        self,
+        subject: str,
+        predicate: str,
+        object_: str,
+        confidence: float = 0.5,
+        experience_id: int | None = None,
+        note: str | None = None,
+        contradicts: bool = False,
+    ) -> int:
+        """Upsert-ish triple.
+
+        - If (s,p,o) exists, increase support_count and update confidence.
+        - If contradicts=True, increase contradict_count instead.
+        """
+        with self._conn() as c:
+            return self._add_or_reinforce_triple_conn(
+                c,
+                subject,
+                predicate,
+                object_,
+                confidence=confidence,
+                experience_id=experience_id,
+                note=note,
+                contradicts=contradicts,
+            )
 
     # Backwards-compatible alias
     def add_triple(self, subject: str, predicate: str, object_: str, confidence: float = 0.5, experience_id: int | None = None, note: str | None = None) -> int:
@@ -1006,7 +1029,8 @@ class Store:
                     eid = int(cur.lastrowid)
 
                     # reinforce chosen triple with strong confidence and evidence link
-                    self.add_or_reinforce_triple(
+                    self._add_or_reinforce_triple_conn(
+                        c,
                         subject,
                         predicate,
                         chosen_object,
@@ -1025,7 +1049,8 @@ class Store:
                         ).fetchall()
                     ]
                     for obj in others[:5]:
-                        self.add_or_reinforce_triple(
+                        self._add_or_reinforce_triple_conn(
+                            c,
                             subject,
                             predicate,
                             obj,
