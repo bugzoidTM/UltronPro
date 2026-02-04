@@ -55,6 +55,19 @@ class Store:
             )
             c.execute(
                 """
+                CREATE TABLE IF NOT EXISTS laws(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  created_at REAL NOT NULL,
+                  updated_at REAL,
+                  status TEXT NOT NULL, -- active|archived
+                  title TEXT,
+                  text TEXT NOT NULL,
+                  source_id TEXT
+                )
+                """
+            )
+            c.execute(
+                """
                 CREATE TABLE IF NOT EXISTS goals(
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   created_at REAL NOT NULL,
@@ -317,6 +330,32 @@ class Store:
         with self._conn() as c:
             c.execute("UPDATE experiences SET processed_at=? WHERE id=?", (_ts(), int(eid)))
 
+    # --- laws
+    def add_law(self, text: str, title: str | None = None, source_id: str | None = None) -> int:
+        text = (text or '').strip()
+        if not text:
+            raise ValueError('empty law')
+        now = _ts()
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO laws(created_at,updated_at,status,title,text,source_id) VALUES(?,?,?,?,?,?)",
+                (now, now, 'active', title, text, source_id),
+            )
+            return int(cur.lastrowid)
+
+    def list_laws(self, status: str = 'active', limit: int = 50) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, created_at, updated_at, status, title, text, source_id FROM laws WHERE status=? ORDER BY id DESC LIMIT ?",
+                (status, int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows][::-1]
+
+    def archive_law(self, law_id: int):
+        now = _ts()
+        with self._conn() as c:
+            c.execute("UPDATE laws SET status='archived', updated_at=? WHERE id=?", (now, int(law_id)))
+
     # --- questions
     def list_open_questions(self, limit: int = 50) -> list[str]:
         with self._conn() as c:
@@ -552,7 +591,11 @@ class Store:
         return out
 
     def register_contradiction(self, contradiction: dict[str, Any]):
-        """Update source contradict counts for evidence tied to conflicting triples."""
+        """Update source contradict counts for evidence tied to conflicting triples.
+
+        NOTE: This must be called only when a conflict is NEW or CHANGED.
+        Otherwise, repeated penalty every loop will destroy trust incorrectly.
+        """
         subject = contradiction.get('subject')
         predicate = contradiction.get('predicate')
         if not subject or not predicate:

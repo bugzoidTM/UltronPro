@@ -17,6 +17,36 @@ _PATTERNS: list[tuple[re.Pattern, str]] = [
 ]
 
 
+def extract_norms(text: str) -> list[tuple[str, str, str, float]]:
+    """Extract normative 'laws' into a simple triple form.
+
+    This is intentionally heuristic and Portuguese-biased.
+    Output triples use subject='AGI' predicate='deve'.
+    """
+    out: list[tuple[str, str, str, float]] = []
+    if not text:
+        return out
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    for l in lines:
+        ll = l.lower()
+        if ll.startswith('lei ') or ll.startswith('lei:') or ll.startswith('lei-'):
+            continue
+        # common patterns: "Você deve ...", "Busque ...", "Não ...", "Valorize ..."
+        if ll.startswith('você deve '):
+            out.append(('AGI', 'deve', l[len('Você deve '):].strip(), 0.75))
+        elif ll.startswith('busque '):
+            out.append(('AGI', 'deve', l.strip(), 0.7))
+        elif ll.startswith('valorize '):
+            out.append(('AGI', 'deve', l.strip(), 0.7))
+        elif ll.startswith('reconheça '):
+            out.append(('AGI', 'deve', l.strip(), 0.7))
+        elif ll.startswith('interprete '):
+            out.append(('AGI', 'deve', l.strip(), 0.7))
+        elif ll.startswith('não '):
+            out.append(('AGI', 'não_deve', l[len('Não '):].strip(), 0.7))
+    return out
+
+
 def extract_triples(text: str) -> list[tuple[str, str, str, float]]:
     """Return list of (subject,predicate,object,confidence)."""
     out: list[tuple[str, str, str, float]] = []

@@ -11,7 +11,7 @@ from fastapi import UploadFile, File
 
 from ultronpro.store import Store
 from ultronpro.curiosity import CuriosityProcessor
-from ultronpro.extract import extract_triples
+from ultronpro.extract import extract_triples, extract_norms
 from ultronpro.media import save_upload
 from ultronpro.perception import image_basic_facts
 from ultronpro.federated import export_bundle, import_bundle
@@ -36,8 +36,13 @@ async def _autonomous_loop():
 
             # 1) Batch absorption: process new experiences into triples
             for e in store.list_unprocessed_experiences(limit=10):
-                triples = extract_triples(e.get('text') or '')
-                for (s, p, o, conf) in triples[:10]:
+                txt = e.get('text') or ''
+                triples = extract_triples(txt)
+                norms = []
+                if (e.get('modality') or '').lower() == 'law':
+                    norms = extract_norms(txt)
+
+                for (s, p, o, conf) in (triples[:10] + norms[:10]):
                     store.add_or_reinforce_triple(s, p, o, confidence=conf, experience_id=e.get('id'), note="from_experience")
                 store.mark_experience_processed(int(e.get('id')))
 
@@ -49,11 +54,19 @@ async def _autonomous_loop():
 
             # 3) Synthesis questions on contradictions + persisted doubt + source governance
             for c in store.find_contradictions(min_conf=0.6):
-                store.register_contradiction(c)
                 info = store.upsert_conflict(c)
                 if info:
                     cid = int(info['id'])
-                    if store.should_prompt_conflict(cid, is_new=bool(info.get('is_new')), has_new_variant=bool(info.get('has_new_variant')), cooldown_hours=12.0):
+                    # IMPORTANT: only penalize sources when the conflict is NEW or CHANGED.
+                    if bool(info.get('is_new')) or bool(info.get('has_new_variant')):
+                        store.register_contradiction(c)
+
+                    if store.should_prompt_conflict(
+                        cid,
+                        is_new=bool(info.get('is_new')),
+                        has_new_variant=bool(info.get('has_new_variant')),
+                        cooldown_hours=12.0,
+                    ):
                         store.add_synthesis_question_if_needed(c, conflict_id=cid)
         except Exception:
             pass
@@ -75,6 +88,7 @@ class Ingest(BaseModel):
     source_id: str | None = None
     modality: str = Field(default="text")
     text: str | None = Field(default=None, max_length=20000)
+    title: str | None = Field(default=None, max_length=200)
 
 
 class Answer(BaseModel):
@@ -95,6 +109,11 @@ async def status():
 async def ingest(req: Ingest):
     if req.source_id:
         store.ensure_source(req.source_id, kind="manual", label=req.source_id)
+
+    # If this is a 'law', persist it explicitly as legislation (primary law scaffolding).
+    if (req.modality or '').lower() == 'law' and req.text:
+        store.add_law(req.text, title=req.title, source_id=req.source_id)
+
     eid = store.add_experience(req.user_id, req.text, source_id=req.source_id, modality=req.modality)
 
     # Auto-curiosidade: após ingerir, mantenha pelo menos 3 perguntas abertas.
@@ -198,6 +217,17 @@ async def dismiss(req: Dismiss):
 @app.post("/api/reset/questions")
 async def reset_questions():
     store.reset_questions()
+    return {"success": True}
+
+
+@app.get("/api/laws")
+async def list_laws(status: str = 'active', limit: int = 50):
+    return {"success": True, "laws": store.list_laws(status=status, limit=limit)}
+
+
+@app.post("/api/laws/{law_id}/archive")
+async def archive_law(law_id: int):
+    store.archive_law(law_id)
     return {"success": True}
 
 
