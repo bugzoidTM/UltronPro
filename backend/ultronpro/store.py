@@ -263,6 +263,32 @@ class Store:
                     pass
 
     # --- experiences
+    def _ensure_source_conn(
+        self,
+        c: sqlite3.Connection,
+        source_id: str,
+        kind: str | None = None,
+        label: str | None = None,
+        trust: float | None = None,
+    ):
+        row = c.execute("SELECT id FROM sources WHERE id=?", (source_id,)).fetchone()
+        if row:
+            return
+        c.execute(
+            "INSERT INTO sources(id, created_at, updated_at, kind, label, trust, support_count, contradict_count, notes) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                source_id,
+                _ts(),
+                _ts(),
+                kind,
+                label,
+                float(trust) if trust is not None else 0.5,
+                0,
+                0,
+                None,
+            ),
+        )
+
     def ensure_source(
         self,
         source_id: str,
@@ -271,23 +297,7 @@ class Store:
         trust: float | None = None,
     ):
         with self._conn() as c:
-            row = c.execute("SELECT id FROM sources WHERE id=?", (source_id,)).fetchone()
-            if row:
-                return
-            c.execute(
-                "INSERT INTO sources(id, created_at, updated_at, kind, label, trust, support_count, contradict_count, notes) VALUES(?,?,?,?,?,?,?,?,?)",
-                (
-                    source_id,
-                    _ts(),
-                    _ts(),
-                    kind,
-                    label,
-                    float(trust) if trust is not None else 0.5,
-                    0,
-                    0,
-                    None,
-                ),
-            )
+            self._ensure_source_conn(c, source_id, kind=kind, label=label, trust=trust)
 
     def _recompute_source_trust(self, c: sqlite3.Connection, source_id: str):
         row = c.execute(
@@ -609,63 +619,63 @@ class Store:
         object_ = object_.strip()
 
         row = c.execute(
-                "SELECT id, confidence, support_count, contradict_count FROM triples WHERE subject=? AND predicate=? AND object=? ORDER BY id DESC LIMIT 1",
-                (subject, predicate, object_),
-            ).fetchone()
+            "SELECT id, confidence, support_count, contradict_count FROM triples WHERE subject=? AND predicate=? AND object=? ORDER BY id DESC LIMIT 1",
+            (subject, predicate, object_),
+        ).fetchone()
 
-            if row:
-                tid = int(row[0])
-                support = int(row[2] or 1)
-                contra = int(row[3] or 0)
-                if contradicts:
-                    contra += 1
-                else:
-                    support += 1
-
-                # simple confidence update: move towards 1 with support, towards 0 with contradiction
-                base = float(row[1] or 0.5)
-                delta = 0.05
-                if contradicts:
-                    base = max(0.05, base - delta)
-                else:
-                    base = min(0.95, base + delta)
-
-                c.execute(
-                    "UPDATE triples SET updated_at=?, confidence=?, support_count=?, contradict_count=? WHERE id=?",
-                    (now, base, support, contra, tid),
-                )
+        if row:
+            tid = int(row[0])
+            support = int(row[2] or 1)
+            contra = int(row[3] or 0)
+            if contradicts:
+                contra += 1
             else:
-                # initial counts
-                support = 0 if contradicts else 1
-                contra = 1 if contradicts else 0
-                cur = c.execute(
-                    "INSERT INTO triples(created_at,updated_at,subject,predicate,object,confidence,support_count,contradict_count) VALUES(?,?,?,?,?,?,?,?)",
-                    (now, now, subject, predicate, object_, float(confidence), support, contra),
-                )
-                tid = int(cur.lastrowid)
+                support += 1
 
-            if experience_id or note:
-                c.execute(
-                    "INSERT INTO triple_evidence(triple_id, experience_id, note, created_at) VALUES(?,?,?,?)",
-                    (tid, experience_id, note, now),
-                )
+            # simple confidence update: move towards 1 with support, towards 0 with contradiction
+            base = float(row[1] or 0.5)
+            delta = 0.05
+            if contradicts:
+                base = max(0.05, base - delta)
+            else:
+                base = min(0.95, base + delta)
 
-                # governance: bump source support based on experience.source_id
-                try:
-                    if experience_id:
-                        er = c.execute(
-                            "SELECT source_id FROM experiences WHERE id=?",
-                            (int(experience_id),),
-                        ).fetchone()
-                        src = (er[0] if er else None)
-                        if src and not contradicts:
-                            c.execute(
-                                "UPDATE sources SET support_count=support_count+1, updated_at=? WHERE id=?",
-                                (now, src),
-                            )
-                            self._recompute_source_trust(c, src)
-                except Exception:
-                    pass
+            c.execute(
+                "UPDATE triples SET updated_at=?, confidence=?, support_count=?, contradict_count=? WHERE id=?",
+                (now, base, support, contra, tid),
+            )
+        else:
+            # initial counts
+            support = 0 if contradicts else 1
+            contra = 1 if contradicts else 0
+            cur = c.execute(
+                "INSERT INTO triples(created_at,updated_at,subject,predicate,object,confidence,support_count,contradict_count) VALUES(?,?,?,?,?,?,?,?)",
+                (now, now, subject, predicate, object_, float(confidence), support, contra),
+            )
+            tid = int(cur.lastrowid)
+
+        if experience_id or note:
+            c.execute(
+                "INSERT INTO triple_evidence(triple_id, experience_id, note, created_at) VALUES(?,?,?,?)",
+                (tid, experience_id, note, now),
+            )
+
+            # governance: bump source support based on experience.source_id
+            try:
+                if experience_id:
+                    er = c.execute(
+                        "SELECT source_id FROM experiences WHERE id=?",
+                        (int(experience_id),),
+                    ).fetchone()
+                    src = (er[0] if er else None)
+                    if src and not contradicts:
+                        c.execute(
+                            "UPDATE sources SET support_count=support_count+1, updated_at=? WHERE id=?",
+                            (now, src),
+                        )
+                        self._recompute_source_trust(c, src)
+            except Exception:
+                pass
 
         return tid
 
@@ -1017,7 +1027,7 @@ class Store:
                         src = "human:unknown"
                     # ensure source exists
                     try:
-                        self.ensure_source(src, kind="human", label=src)
+                        self._ensure_source_conn(c, src, kind="human", label=src)
                     except Exception:
                         pass
 
@@ -1094,7 +1104,7 @@ class Store:
                     other_srcs = sources_for_tids(other_tids)
 
                     for ssrc in chosen_srcs:
-                        self.ensure_source(ssrc)
+                        self._ensure_source_conn(c, ssrc)
                         c.execute(
                             "UPDATE sources SET support_count=support_count+1, updated_at=? WHERE id=?",
                             (now, ssrc),
@@ -1102,7 +1112,7 @@ class Store:
                         self._recompute_source_trust(c, ssrc)
 
                     for ssrc in (other_srcs - chosen_srcs):
-                        self.ensure_source(ssrc)
+                        self._ensure_source_conn(c, ssrc)
                         c.execute(
                             "UPDATE sources SET contradict_count=contradict_count+1, updated_at=? WHERE id=?",
                             (now, ssrc),
