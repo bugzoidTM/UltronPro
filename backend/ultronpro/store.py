@@ -76,6 +76,23 @@ class Store:
             )
             c.execute(
                 """
+                CREATE TABLE IF NOT EXISTS actions(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  created_at REAL NOT NULL,
+                  updated_at REAL,
+                  status TEXT NOT NULL, -- queued|running|done|blocked|error
+                  kind TEXT NOT NULL,
+                  text TEXT NOT NULL,
+                  priority INTEGER NOT NULL DEFAULT 0,
+                  policy_allowed INTEGER,
+                  policy_score REAL,
+                  last_error TEXT,
+                  meta_json TEXT
+                )
+                """
+            )
+            c.execute(
+                """
                 CREATE TABLE IF NOT EXISTS goals(
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   created_at REAL NOT NULL,
@@ -466,6 +483,61 @@ class Store:
         with self._conn() as c:
             c.execute("UPDATE laws SET status='archived', updated_at=? WHERE id=?", (now, int(law_id)))
 
+    # --- actions
+    def enqueue_action(self, kind: str, text: str, priority: int = 0, meta_json: str | None = None) -> int:
+        now = _ts()
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO actions(created_at,updated_at,status,kind,text,priority,meta_json) VALUES(?,?,?,?,?,?,?)",
+                (now, now, 'queued', kind, text, int(priority or 0), meta_json),
+            )
+            return int(cur.lastrowid)
+
+    def next_action(self) -> dict[str, Any] | None:
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT id, created_at, updated_at, status, kind, text, priority, policy_allowed, policy_score, last_error, meta_json
+                FROM actions
+                WHERE status='queued'
+                ORDER BY priority DESC, id ASC
+                LIMIT 1
+                """,
+            ).fetchone()
+        return dict(row) if row else None
+
+    def mark_action(self, action_id: int, status: str, *, policy_allowed: bool | None = None, policy_score: float | None = None, last_error: str | None = None):
+        now = _ts()
+        with self._conn() as c:
+            c.execute(
+                """
+                UPDATE actions
+                SET status=?, updated_at=?, policy_allowed=COALESCE(?,policy_allowed), policy_score=COALESCE(?,policy_score), last_error=COALESCE(?,last_error)
+                WHERE id=?
+                """,
+                (
+                    status,
+                    now,
+                    (1 if policy_allowed else 0) if policy_allowed is not None else None,
+                    float(policy_score) if policy_score is not None else None,
+                    last_error,
+                    int(action_id),
+                ),
+            )
+
+    def list_actions(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, created_at, updated_at, status, kind, text, priority, policy_allowed, policy_score, last_error
+                FROM actions
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows][::-1]
+
     # --- questions
     def list_open_questions(self, limit: int = 50) -> list[str]:
         with self._conn() as c:
@@ -604,6 +676,20 @@ class Store:
     # Backwards-compatible alias
     def add_triple(self, subject: str, predicate: str, object_: str, confidence: float = 0.5, experience_id: int | None = None, note: str | None = None) -> int:
         return self.add_or_reinforce_triple(subject, predicate, object_, confidence, experience_id, note)
+
+    def list_triples_since(self, since_id: int = 0, limit: int = 500) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, subject, predicate, object, confidence
+                FROM triples
+                WHERE id > ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (int(since_id), int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def list_norms(self, limit: int = 200) -> list[dict[str, Any]]:
         """Return compiled norms for gating (subject='AGI')."""

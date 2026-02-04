@@ -41,11 +41,20 @@
     </div>
   </div>
 
-  <div class="card" style="margin-top:12px">
-    <h3>Status</h3>
-    <pre id="status" class="muted">...</pre>
+  <div class="row" style="margin-top:12px">
+    <div class="card" style="flex:1;min-width:340px">
+      <h3>Status</h3>
+      <pre id="status" class="muted">...</pre>
+    </div>
+    <div class="card" style="flex:1;min-width:340px">
+      <h3>Cérebro (Grafo) — crescimento</h3>
+      <div class="muted">Novas triplas aparecem como nós/arestas. (Polling a cada 2s)</div>
+      <div id="graph" style="height:420px;border:1px solid #233648;border-radius:12px;margin-top:10px"></div>
+      <div class="muted" id="graphStats" style="margin-top:8px"></div>
+    </div>
   </div>
 
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
 <script>
 async function jfetch(url, opts){
   const r = await fetch(url, opts);
@@ -57,6 +66,56 @@ async function jfetch(url, opts){
 
 let currentQ=null;
 function setMsg(s){document.getElementById('msg').textContent=s||''}
+
+// --- Graph
+let network=null;
+let nodeData=null;
+let edgeData=null;
+let nodeIdByLabel=new Map();
+let lastTripleId=0;
+let edgeKeySet=new Set();
+
+function ensureGraph(){
+  if(network) return;
+  nodeData = new vis.DataSet([]);
+  edgeData = new vis.DataSet([]);
+  const container = document.getElementById('graph');
+  network = new vis.Network(container, {nodes: nodeData, edges: edgeData}, {
+    nodes:{shape:'dot',size:12,font:{color:'#e5e7eb'} ,color:{background:'#60a5fa',border:'#1d4ed8'}},
+    edges:{color:'#94a3b8',font:{align:'middle',color:'#cbd5e1'},arrows:{to:{enabled:true,scaleFactor:0.6}}},
+    physics:{stabilization:false, barnesHut:{gravitationalConstant:-18000, springLength:120}}
+  });
+}
+
+function nid(label){
+  label = (label||'').trim();
+  if(!label) label='(vazio)';
+  if(nodeIdByLabel.has(label)) return nodeIdByLabel.get(label);
+  const id = 'n'+(nodeIdByLabel.size+1);
+  nodeIdByLabel.set(label, id);
+  nodeData.add({id, label});
+  return id;
+}
+
+async function graphTick(){
+  try{
+    ensureGraph();
+    const j = await jfetch('/api/graph/triples?since_id='+lastTripleId+'&limit=500');
+    const triples = j.triples || [];
+    for(const t of triples){
+      lastTripleId = Math.max(lastTripleId, t.id||0);
+      const a = nid(t.subject);
+      const b = nid(t.object);
+      const key = a+'|'+t.predicate+'|'+b;
+      if(edgeKeySet.has(key)) continue;
+      edgeKeySet.add(key);
+      edgeData.add({from:a,to:b,label:t.predicate});
+    }
+    document.getElementById('graphStats').textContent = `nós=${nodeData.length} arestas=${edgeData.length} lastTripleId=${lastTripleId}`;
+  }catch(e){
+    document.getElementById('graphStats').textContent = 'graph error: '+e.message;
+  }
+}
 
 async function load(){
   const st = await jfetch('/api/status');
@@ -107,6 +166,8 @@ document.getElementById('skip').onclick = async () => {
 };
 
 load();
+setInterval(graphTick, 2000);
+graphTick();
 </script>
 </body>
 </html>

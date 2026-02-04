@@ -17,6 +17,8 @@ from ultronpro.perception import image_basic_facts
 from ultronpro.federated import export_bundle, import_bundle
 from ultronpro.signing import sign_bundle, verify_bundle
 from ultronpro.policy import evaluate_action
+from ultronpro.planner import propose_actions
+import json
 
 
 store = Store("/app/data/ultronpro.sqlite")
@@ -69,6 +71,33 @@ async def _autonomous_loop():
                         cooldown_hours=12.0,
                     ):
                         store.add_synthesis_question_if_needed(c, conflict_id=cid)
+
+            # 4) Planner/Executor: propose internal actions and run them through policy gate
+            act = store.next_action()
+            if not act:
+                for pa in propose_actions(store):
+                    store.enqueue_action(pa.kind, pa.text, priority=pa.priority, meta_json=json.dumps(pa.meta or {}))
+                    break
+                act = store.next_action()
+
+            if act:
+                try:
+                    store.mark_action(int(act['id']), 'running')
+                    norms = store.list_norms(limit=200)
+                    v = evaluate_action(act.get('text') or '', norms)
+                    if not v.allowed:
+                        store.mark_action(int(act['id']), 'blocked', policy_allowed=False, policy_score=v.score, last_error='policy_block')
+                    else:
+                        # Execute only internal safe actions: turn into a question
+                        if act.get('kind') in ('ask_evidence','clarify_laws'):
+                            store.add_questions([{"question": act.get('text') or 'Ação', "context": 'executor', "priority": 4}])
+                        elif act.get('kind') == 'generate_questions':
+                            exps = store.list_experiences(limit=40)
+                            open_q = store.list_open_questions(limit=50)
+                            store.add_questions(curiosity.propose(exps, open_q))
+                        store.mark_action(int(act['id']), 'done', policy_allowed=True, policy_score=v.score)
+                except Exception as e:
+                    store.mark_action(int(act['id']), 'error', last_error=str(e)[:500])
         except Exception:
             pass
         await asyncio.sleep(20)
@@ -229,6 +258,16 @@ async def list_laws(status: str = 'active', limit: int = 50):
 @app.get("/api/norms")
 async def list_norms(limit: int = 200):
     return {"success": True, "norms": store.list_norms(limit=limit)}
+
+
+@app.get("/api/graph/triples")
+async def graph_triples(since_id: int = 0, limit: int = 500):
+    return {"success": True, "triples": store.list_triples_since(since_id=since_id, limit=limit)}
+
+
+@app.get("/api/actions")
+async def actions(limit: int = 50):
+    return {"success": True, "actions": store.list_actions(limit=limit)}
 
 
 @app.post("/api/laws/{law_id}/archive")
