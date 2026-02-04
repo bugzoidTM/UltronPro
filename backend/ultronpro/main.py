@@ -47,10 +47,11 @@ async def _autonomous_loop():
                 open_q = store.list_open_questions(limit=50)
                 store.add_questions(curiosity.propose(exps, open_q))
 
-            # 3) Synthesis questions on contradictions + source governance
+            # 3) Synthesis questions on contradictions + persisted doubt + source governance
             for c in store.find_contradictions(min_conf=0.6):
                 store.register_contradiction(c)
-                store.add_synthesis_question_if_needed(c)
+                cid = store.upsert_conflict(c)
+                store.add_synthesis_question_if_needed(c, conflict_id=cid)
         except Exception:
             pass
         await asyncio.sleep(20)
@@ -194,6 +195,35 @@ async def dismiss(req: Dismiss):
 @app.post("/api/reset/questions")
 async def reset_questions():
     store.reset_questions()
+    return {"success": True}
+
+
+@app.get("/api/conflicts")
+async def list_conflicts(status: str = 'open', limit: int = 50):
+    return {"success": True, "conflicts": store.list_conflicts(status=status, limit=limit)}
+
+
+@app.get("/api/conflicts/{conflict_id}")
+async def get_conflict(conflict_id: int):
+    c = store.get_conflict(conflict_id)
+    if not c:
+        raise HTTPException(status_code=404, detail="Conflict not found")
+    return {"success": True, "conflict": c}
+
+
+class ResolveConflict(BaseModel):
+    resolution: str | None = Field(default=None, max_length=2000)
+
+
+@app.post("/api/conflicts/{conflict_id}/resolve")
+async def resolve_conflict(conflict_id: int, req: ResolveConflict):
+    store.resolve_conflict(conflict_id, resolution=req.resolution)
+    return {"success": True}
+
+
+@app.post("/api/conflicts/{conflict_id}/archive")
+async def archive_conflict(conflict_id: int):
+    store.archive_conflict(conflict_id)
     return {"success": True}
 
 

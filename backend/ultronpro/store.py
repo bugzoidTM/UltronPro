@@ -67,6 +67,38 @@ class Store:
             )
             c.execute(
                 """
+                CREATE TABLE IF NOT EXISTS conflicts(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  created_at REAL NOT NULL,
+                  updated_at REAL,
+                  status TEXT NOT NULL, -- open|resolved|archived
+                  subject TEXT NOT NULL,
+                  predicate TEXT NOT NULL,
+                  key TEXT NOT NULL, -- subject\u241Fp\u241F for uniqueness
+                  first_seen_at REAL NOT NULL,
+                  last_seen_at REAL NOT NULL,
+                  seen_count INTEGER NOT NULL DEFAULT 1,
+                  last_summary TEXT
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conflict_variants(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  conflict_id INTEGER NOT NULL,
+                  triple_id INTEGER,
+                  object TEXT,
+                  confidence REAL,
+                  first_seen_at REAL NOT NULL,
+                  last_seen_at REAL NOT NULL,
+                  seen_count INTEGER NOT NULL DEFAULT 1,
+                  FOREIGN KEY(conflict_id) REFERENCES conflicts(id)
+                )
+                """
+            )
+            c.execute(
+                """
                 CREATE TABLE IF NOT EXISTS questions(
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   created_at REAL NOT NULL,
@@ -136,6 +168,10 @@ class Store:
                         c.execute(ddl)
                     except Exception:
                         pass
+
+            # migrations for conflicts
+            conf_cols = {r[1] for r in c.execute("PRAGMA table_info(conflicts)").fetchall()} if c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='conflicts'").fetchone() else set()
+            # (for initial versions, table is created above; keep future-proof here)
 
             cols = {r[1] for r in c.execute("PRAGMA table_info(triples)").fetchall()}
             if "updated_at" not in cols:
@@ -533,12 +569,137 @@ class Store:
                 )
                 self._recompute_source_trust(c, src)
 
-    def add_synthesis_question_if_needed(self, contradiction: dict[str, Any]):
+    def upsert_conflict(self, contradiction: dict[str, Any]) -> int | None:
+        """Persist 'doubt' about a contradiction so it doesn't evaporate."""
+        subject = (contradiction.get('subject') or '').strip()
+        predicate = (contradiction.get('predicate') or '').strip()
+        objs = contradiction.get('objects') or []
+        if not subject or not predicate or len(objs) < 2:
+            return None
+        if predicate == "(é vs não_é)":
+            # keep as ephemeral for now (could be persisted later with normalization)
+            return None
+
+        key = f"{subject}\u241F{predicate}"
+        now = _ts()
+
+        # Build a short summary snapshot
+        opts = ", ".join((o.get('object') or '') for o in objs if o.get('object'))
+        summary = f"{subject} {predicate} -> {opts}"[:500]
+
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT id, first_seen_at, seen_count FROM conflicts WHERE key=? AND status='open' ORDER BY id DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+
+            if row:
+                cid = int(row[0])
+                seen = int(row[2] or 1) + 1
+                c.execute(
+                    "UPDATE conflicts SET updated_at=?, last_seen_at=?, seen_count=?, last_summary=? WHERE id=?",
+                    (now, now, seen, summary, cid),
+                )
+            else:
+                cur = c.execute(
+                    "INSERT INTO conflicts(created_at,updated_at,status,subject,predicate,key,first_seen_at,last_seen_at,seen_count,last_summary) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (now, now, 'open', subject, predicate, key, now, now, 1, summary),
+                )
+                cid = int(cur.lastrowid)
+
+            # Update variants
+            for o in objs[:12]:
+                obj = (o.get('object') or '').strip() if isinstance(o, dict) else str(o)
+                conf = float(o.get('confidence') or 0.5) if isinstance(o, dict) else 0.5
+                tid = o.get('id') if isinstance(o, dict) and o.get('id') is not None else None
+
+                # de-dupe on (conflict_id, object)
+                v = c.execute(
+                    "SELECT id, seen_count FROM conflict_variants WHERE conflict_id=? AND object=? ORDER BY id DESC LIMIT 1",
+                    (cid, obj),
+                ).fetchone()
+                if v:
+                    vid = int(v[0])
+                    vseen = int(v[1] or 1) + 1
+                    c.execute(
+                        "UPDATE conflict_variants SET last_seen_at=?, seen_count=?, confidence=?, triple_id=? WHERE id=?",
+                        (now, vseen, conf, tid, vid),
+                    )
+                else:
+                    c.execute(
+                        "INSERT INTO conflict_variants(conflict_id,triple_id,object,confidence,first_seen_at,last_seen_at,seen_count) VALUES(?,?,?,?,?,?,?)",
+                        (cid, tid, obj, conf, now, now, 1),
+                    )
+
+            return cid
+
+    def list_conflicts(self, status: str = 'open', limit: int = 50) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, created_at, updated_at, status, subject, predicate, first_seen_at, last_seen_at, seen_count, last_summary
+                FROM conflicts
+                WHERE status=?
+                ORDER BY last_seen_at DESC, id DESC
+                LIMIT ?
+                """,
+                (status, int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_conflict(self, cid: int) -> dict[str, Any] | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT id, created_at, updated_at, status, subject, predicate, first_seen_at, last_seen_at, seen_count, last_summary FROM conflicts WHERE id=?",
+                (int(cid),),
+            ).fetchone()
+            if not row:
+                return None
+            variants = c.execute(
+                """
+                SELECT id, triple_id, object, confidence, first_seen_at, last_seen_at, seen_count
+                FROM conflict_variants
+                WHERE conflict_id=?
+                ORDER BY confidence DESC, seen_count DESC, id DESC
+                """,
+                (int(cid),),
+            ).fetchall()
+        out = dict(row)
+        out['variants'] = [dict(v) for v in variants]
+        return out
+
+    def resolve_conflict(self, cid: int, resolution: str | None = None):
+        now = _ts()
+        with self._conn() as c:
+            c.execute(
+                "UPDATE conflicts SET status='resolved', updated_at=?, last_summary=COALESCE(?, last_summary) WHERE id=?",
+                (now, resolution, int(cid)),
+            )
+
+    def archive_conflict(self, cid: int):
+        now = _ts()
+        with self._conn() as c:
+            c.execute(
+                "UPDATE conflicts SET status='archived', updated_at=? WHERE id=?",
+                (now, int(cid)),
+            )
+
+    def add_synthesis_question_if_needed(self, contradiction: dict[str, Any], conflict_id: int | None = None):
         subject = contradiction.get('subject')
         predicate = contradiction.get('predicate')
         objs = contradiction.get('objects') or []
         if not subject or not predicate or len(objs) < 2:
             return
-        opts = ", ".join(o.get('object') for o in objs if o.get('object'))
+
+        opts = ", ".join(o.get('object') for o in objs if isinstance(o, dict) and o.get('object'))
+
+        # Include 'persisted doubt' context
+        ctx = None
+        if conflict_id:
+            c = self.get_conflict(int(conflict_id))
+            if c:
+                age_days = max(0.0, (_ts() - float(c.get('first_seen_at') or _ts())) / 86400.0)
+                ctx = f"Conflito ativo há {age_days:.1f} dias; visto {c.get('seen_count')} vezes; last={c.get('last_summary')}"
+
         q = f"(síntese) Encontrei contradição: '{subject}' {predicate} -> {opts}. Qual é a formulação correta? Em que contexto cada uma vale?"
-        self.add_questions([{ "question": q, "context": None, "priority": 5 }])
+        self.add_questions([{ "question": q, "context": ctx, "priority": 5 }])
