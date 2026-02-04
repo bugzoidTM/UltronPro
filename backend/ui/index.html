@@ -81,10 +81,48 @@ function ensureGraph(){
   edgeData = new vis.DataSet([]);
   const container = document.getElementById('graph');
   network = new vis.Network(container, {nodes: nodeData, edges: edgeData}, {
-    nodes:{shape:'dot',size:12,font:{color:'#e5e7eb'} ,color:{background:'#60a5fa',border:'#1d4ed8'}},
+    nodes:{shape:'dot',size:12,font:{color:'#e5e7eb'}},
     edges:{color:'#94a3b8',font:{align:'middle',color:'#cbd5e1'},arrows:{to:{enabled:true,scaleFactor:0.6}}},
     physics:{stabilization:false, barnesHut:{gravitationalConstant:-18000, springLength:120}}
   });
+}
+
+function styleForType(t){
+  // conflict > norm > fact
+  if(t==='conflict') return {color:{background:'#f97316',border:'#9a3412'}, size:15};
+  if(t==='norm') return {color:{background:'#a78bfa',border:'#6d28d9'}, size:14};
+  return {color:{background:'#60a5fa',border:'#1d4ed8'}, size:12};
+}
+
+function sparkNode(id){
+  try{
+    nodeData.update({id, color:{background:'#fef08a',border:'#eab308'}, size:18});
+    setTimeout(()=>{
+      const n=nodeData.get(id);
+      if(!n) return;
+      const t=n._type||'fact';
+      const st=styleForType(t);
+      nodeData.update({id, color:st.color, size:st.size});
+    }, 900);
+  }catch{}
+}
+
+function sparkEdge(id){
+  try{
+    edgeData.update({id, color:'#fef08a', width:3});
+    setTimeout(()=>{ if(edgeData.get(id)) edgeData.update({id, color:'#94a3b8', width:1}); }, 900);
+  }catch{}
+}
+
+function setNodeType(id, t){
+  const n = nodeData.get(id);
+  if(!n) return;
+  const prev = n._type || 'fact';
+  // escalate only
+  const rank = {fact:0, norm:1, conflict:2};
+  if(rank[t] <= rank[prev]) return;
+  const st = styleForType(t);
+  nodeData.update({id, _type:t, color:st.color, size:st.size});
 }
 
 function nid(label){
@@ -93,23 +131,63 @@ function nid(label){
   if(nodeIdByLabel.has(label)) return nodeIdByLabel.get(label);
   const id = 'n'+(nodeIdByLabel.size+1);
   nodeIdByLabel.set(label, id);
-  nodeData.add({id, label});
+  const st = styleForType(label==='AGI' ? 'norm' : 'fact');
+  nodeData.add({id, label, _type:(label==='AGI' ? 'norm' : 'fact'), color: st.color, size: st.size});
+  sparkNode(id);
   return id;
+}
+
+let lastConflictFetch=0;
+let conflictNodeLabels=new Set();
+
+async function conflictsTick(){
+  // update types based on open conflicts (every ~10s)
+  try{
+    if(Date.now()-lastConflictFetch < 10000) return;
+    lastConflictFetch = Date.now();
+    const j = await jfetch('/api/graph/conflicts?limit=25');
+    const conflicts = j.conflicts || [];
+    const labels = new Set();
+    for(const c of conflicts){
+      if(c.subject) labels.add(String(c.subject));
+      const vars = c.variants || [];
+      for(const v of vars){ if(v.object) labels.add(String(v.object)); }
+    }
+    conflictNodeLabels = labels;
+    // apply types
+    for(const [label,id] of nodeIdByLabel.entries()){
+      if(label==='AGI') continue;
+      if(conflictNodeLabels.has(label)) setNodeType(id,'conflict');
+    }
+  }catch{}
 }
 
 async function graphTick(){
   try{
     ensureGraph();
+    await conflictsTick();
+
     const j = await jfetch('/api/graph/triples?since_id='+lastTripleId+'&limit=500');
     const triples = j.triples || [];
     for(const t of triples){
       lastTripleId = Math.max(lastTripleId, t.id||0);
       const a = nid(t.subject);
       const b = nid(t.object);
+
+      // type coloring
+      if(String(t.subject)==='AGI') setNodeType(a,'norm');
+      if(String(t.object)==='AGI') setNodeType(b,'norm');
+      if(conflictNodeLabels.has(String(t.subject)) || conflictNodeLabels.has(String(t.object))) {
+        setNodeType(a,'conflict');
+        setNodeType(b,'conflict');
+      }
+
       const key = a+'|'+t.predicate+'|'+b;
       if(edgeKeySet.has(key)) continue;
       edgeKeySet.add(key);
-      edgeData.add({from:a,to:b,label:t.predicate});
+      const eid = 'e'+edgeKeySet.size;
+      edgeData.add({id:eid, from:a,to:b,label:t.predicate});
+      sparkEdge(eid);
     }
     document.getElementById('graphStats').textContent = `nós=${nodeData.length} arestas=${edgeData.length} lastTripleId=${lastTripleId}`;
   }catch(e){

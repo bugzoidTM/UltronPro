@@ -265,6 +265,18 @@ async def graph_triples(since_id: int = 0, limit: int = 500):
     return {"success": True, "triples": store.list_triples_since(since_id=since_id, limit=limit)}
 
 
+@app.get("/api/graph/conflicts")
+async def graph_conflicts(limit: int = 25):
+    conflicts = store.list_conflicts(status='open', limit=limit)
+    # include variants for coloring nodes
+    enriched = []
+    for c in conflicts:
+        cid = int(c.get('id'))
+        full = store.get_conflict(cid) or c
+        enriched.append(full)
+    return {"success": True, "conflicts": enriched}
+
+
 @app.get("/api/actions")
 async def actions(limit: int = 50):
     return {"success": True, "actions": store.list_actions(limit=limit)}
