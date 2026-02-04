@@ -48,10 +48,17 @@
     </div>
     <div class="card" style="flex:1;min-width:340px">
       <h3>Cérebro (Grafo) — crescimento</h3>
-      <div class="muted">Novas triplas aparecem como nós/arestas. (Polling a cada 2s)</div>
+      <div class="muted">Azul=fatos • Roxo=normas • Laranja=conflitos. Spark quando aprende. (Polling a cada 2s)</div>
       <div id="graph" style="height:420px;border:1px solid #233648;border-radius:12px;margin-top:10px"></div>
       <div class="muted" id="graphStats" style="margin-top:8px"></div>
     </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3>Conflitos (Persistência de Dúvida)</h3>
+    <div class="muted">Resolva escolhendo a variante correta + justificativa. Isso atualiza confiança das fontes.</div>
+    <div id="conflicts" style="margin-top:10px"></div>
+    <div id="cmsg" class="muted" style="margin-top:8px"></div>
   </div>
 
 <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
@@ -195,13 +202,89 @@ async function graphTick(){
   }
 }
 
+function setCMsg(s){document.getElementById('cmsg').textContent=s||''}
+
+function esc(s){return (s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}
+
+async function loadConflicts(){
+  try{
+    const j = await jfetch('/api/conflicts?status=open&limit=20');
+    const cs = j.conflicts || [];
+    const box = document.getElementById('conflicts');
+    if(!cs.length){ box.innerHTML = '<div class="muted">(nenhum conflito aberto)</div>'; return; }
+
+    // fetch full conflict details (variants)
+    const full = [];
+    for(const c of cs){
+      try{
+        const cj = await jfetch('/api/conflicts/'+c.id);
+        full.push(cj.conflict);
+      }catch{ full.push(c); }
+    }
+
+    box.innerHTML = full.map(c=>{
+      const vars = c.variants || [];
+      const opts = vars.map(v=>{
+        const oid = 'c'+c.id+'_v'+v.id;
+        return `<label style="display:block;margin:6px 0"><input type="radio" name="c${c.id}_choice" value="${esc(v.object)}"> <b>${esc(v.object)}</b> <span class=muted>(conf=${(v.confidence||0).toFixed? v.confidence.toFixed(2):v.confidence} seen=${v.seen_count||0})</span></label>`;
+      }).join('') || '<div class="muted">(sem variantes)</div>';
+
+      return `
+        <div style="border:1px solid #233648;border-radius:12px;padding:10px;margin:10px 0">
+          <div><b>#${c.id}</b> <code>${esc(c.subject)}</code> <code>${esc(c.predicate)}</code> <span class=muted>seen=${c.seen_count||0} • perguntas=${c.question_count||0}</span></div>
+          <div class=muted style="margin-top:6px">${esc(c.last_summary||'')}</div>
+          <div style="margin-top:10px">${opts}</div>
+          <div style="margin-top:10px" class=row>
+            <input id="c${c.id}_by" placeholder="decided_by (ex: Vossa Graça)" />
+          </div>
+          <div style="margin-top:8px">
+            <textarea id="c${c.id}_res" rows="3" placeholder="Justificativa / síntese (o porquê)"></textarea>
+          </div>
+          <div style="margin-top:8px">
+            <button onclick="resolveConflict(${c.id})">Resolver conflito</button>
+            <button class="secondary" onclick="archiveConflict(${c.id})">Arquivar</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+  }catch(e){
+    setCMsg('conflicts error: '+e.message);
+  }
+}
+
+async function resolveConflict(id){
+  try{
+    setCMsg('...');
+    const sel = document.querySelector(`input[name="c${id}_choice"]:checked`);
+    const chosen = sel ? sel.value : null;
+    if(!chosen) throw new Error('Escolha uma variante primeiro');
+    const decided_by = document.getElementById('c'+id+'_by').value || null;
+    const resolution = document.getElementById('c'+id+'_res').value || null;
+    await jfetch('/api/conflicts/'+id+'/resolve', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({chosen_object: chosen, decided_by, resolution})});
+    setCMsg('✅ Conflito resolvido');
+    await load();
+    await loadConflicts();
+  }catch(e){ setCMsg('❌ '+e.message); }
+}
+
+async function archiveConflict(id){
+  try{
+    setCMsg('...');
+    await jfetch('/api/conflicts/'+id+'/archive', {method:'POST'});
+    setCMsg('✅ Conflito arquivado');
+    await loadConflicts();
+  }catch(e){ setCMsg('❌ '+e.message); }
+}
+
 async function load(){
   const st = await jfetch('/api/status');
   document.getElementById('status').textContent = JSON.stringify(st, null, 2);
   currentQ = st.next;
   const qbox = document.getElementById('qbox');
-  if(!currentQ){ qbox.textContent='(nenhuma)'; return; }
+  if(!currentQ){ qbox.textContent='(nenhuma)'; await loadConflicts(); return; }
   qbox.innerHTML = '<b>'+currentQ.question+'</b>' + (currentQ.context ? '<div class="muted">Contexto: '+currentQ.context+'</div>' : '') + '<div class="muted">priority='+currentQ.priority+'</div>';
+  await loadConflicts();
 }
 
 document.getElementById('ingest').onclick = async () => {
