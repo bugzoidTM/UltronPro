@@ -1,0 +1,112 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>UltronPRO — Curiosity Processor</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:18px;background:#0f172a;color:#e5e7eb;}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    .card{background:#111a22;border:1px solid #233648;border-radius:12px;padding:14px;max-width:900px}
+    button{background:#1a73e8;color:white;border:0;border-radius:10px;padding:10px 12px;font-weight:800;cursor:pointer}
+    button.secondary{background:#233648}
+    textarea,input{width:100%;box-sizing:border-box;background:#0b1220;border:1px solid #233648;border-radius:10px;color:#e5e7eb;padding:10px;font-family:ui-monospace,Menlo,Consolas,monospace}
+    .muted{color:#92adc9;font-size:12px}
+    h1{margin:0 0 10px}
+    code{color:#93c5fd}
+  </style>
+</head>
+<body>
+  <h1>UltronPRO — Processador de Curiosidade (MVP)</h1>
+  <p class="muted">UltronPRO — Fase 1 (“bebê”): ouvir experiências → gerar perguntas (curiosidade) → receber respostas → consolidar.</p>
+
+  <div class="row">
+    <div class="card" style="flex:1;min-width:340px">
+      <h3>Experiência (input)</h3>
+      <textarea id="exp" rows="5" placeholder="Cole aqui o que aconteceu / o que você quer ensinar..."></textarea>
+      <div style="height:10px"></div>
+      <button id="ingest">Ingerir experiência</button>
+      <button id="refresh" class="secondary">Gerar perguntas (curiosidade)</button>
+      <p id="msg" class="muted"></p>
+    </div>
+
+    <div class="card" style="flex:1;min-width:340px">
+      <h3>Próxima pergunta</h3>
+      <div id="qbox" class="muted">(nenhuma)</div>
+      <div style="height:10px"></div>
+      <textarea id="ans" rows="5" placeholder="Responda aqui..."></textarea>
+      <div style="height:10px"></div>
+      <button id="answer">Salvar resposta</button>
+      <button id="skip" class="secondary">Pular</button>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3>Status</h3>
+    <pre id="status" class="muted">...</pre>
+  </div>
+
+<script>
+async function jfetch(url, opts){
+  const r = await fetch(url, opts);
+  const t = await r.text();
+  let j=null; try{j=JSON.parse(t)}catch{j={raw:t}};
+  if(!r.ok) throw new Error(j.detail||t||('HTTP '+r.status));
+  return j;
+}
+
+let currentQ=null;
+function setMsg(s){document.getElementById('msg').textContent=s||''}
+
+async function load(){
+  const st = await jfetch('/api/status');
+  document.getElementById('status').textContent = JSON.stringify(st, null, 2);
+  currentQ = st.next;
+  const qbox = document.getElementById('qbox');
+  if(!currentQ){ qbox.textContent='(nenhuma)'; return; }
+  qbox.innerHTML = '<b>'+currentQ.question+'</b>' + (currentQ.context ? '<div class="muted">Contexto: '+currentQ.context+'</div>' : '') + '<div class="muted">priority='+currentQ.priority+'</div>';
+}
+
+document.getElementById('ingest').onclick = async () => {
+  try{
+    setMsg('...');
+    await jfetch('/api/ingest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:document.getElementById('exp').value})});
+    setMsg('✅ Experiência ingerida');
+    await load();
+  }catch(e){setMsg('❌ '+e.message)}
+};
+
+document.getElementById('refresh').onclick = async () => {
+  try{
+    setMsg('...');
+    await jfetch('/api/curiosity/refresh',{method:'POST'});
+    setMsg('✅ Perguntas atualizadas');
+    await load();
+  }catch(e){setMsg('❌ '+e.message)}
+};
+
+document.getElementById('answer').onclick = async () => {
+  if(!currentQ) return;
+  try{
+    setMsg('...');
+    await jfetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question_id:currentQ.id,answer:document.getElementById('ans').value})});
+    document.getElementById('ans').value='';
+    setMsg('✅ Resposta salva');
+    await load();
+  }catch(e){setMsg('❌ '+e.message)}
+};
+
+document.getElementById('skip').onclick = async () => {
+  if(!currentQ) return;
+  try{
+    setMsg('...');
+    await jfetch('/api/dismiss',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question_id:currentQ.id})});
+    setMsg('✅ Pergunta pulada');
+    await load();
+  }catch(e){setMsg('❌ '+e.message)}
+};
+
+load();
+</script>
+</body>
+</html>

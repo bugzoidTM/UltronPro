@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  ultronpro:
+    image: ultronpro_backend:local
+    networks:
+      - Nutef
+    volumes:
+      - ultronpro_data:/app/data
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+      labels:
+        - traefik.enable=1
+        - traefik.http.routers.ultronpro.rule=Host(`ultronpro.nutef.com`)
+        - traefik.http.routers.ultronpro.entrypoints=websecure
+        - traefik.http.routers.ultronpro.tls.certresolver=letsencryptresolver
+        - traefik.http.services.ultronpro.loadbalancer.server.port=8000
+
+networks:
+  Nutef:
+    external: true
+
+volumes:
+  ultronpro_data:
