@@ -12,6 +12,8 @@ from fastapi import UploadFile, File
 from ultronpro.store import Store
 from ultronpro.curiosity import CuriosityProcessor
 from ultronpro.extract import extract_triples
+from ultronpro.media import save_upload
+from ultronpro.perception import image_basic_facts
 from ultronpro.federated import export_bundle, import_bundle
 from ultronpro.signing import sign_bundle, verify_bundle
 
@@ -45,8 +47,9 @@ async def _autonomous_loop():
                 open_q = store.list_open_questions(limit=50)
                 store.add_questions(curiosity.propose(exps, open_q))
 
-            # 3) Synthesis questions on contradictions
+            # 3) Synthesis questions on contradictions + source governance
             for c in store.find_contradictions(min_conf=0.6):
+                store.register_contradiction(c)
                 store.add_synthesis_question_if_needed(c)
         except Exception:
             pass
@@ -86,6 +89,8 @@ async def status():
 
 @app.post("/api/ingest")
 async def ingest(req: Ingest):
+    if req.source_id:
+        store.ensure_source(req.source_id, kind="manual", label=req.source_id)
     eid = store.add_experience(req.user_id, req.text, source_id=req.source_id, modality=req.modality)
 
     # Auto-curiosidade: após ingerir, mantenha pelo menos 3 perguntas abertas.
@@ -96,6 +101,59 @@ async def ingest(req: Ingest):
         store.add_questions(curiosity.propose(exps, open_q))
 
     return {"success": True, "experience_id": eid}
+
+
+@app.post("/api/ingest/file")
+async def ingest_file(
+    file: UploadFile = File(...),
+    user_id: str | None = None,
+    source_id: str | None = None,
+):
+    if source_id:
+        store.ensure_source(source_id, kind="upload", label=source_id)
+
+    mime = file.content_type or "application/octet-stream"
+    data = await file.read()
+
+    suffix = ""
+    if mime.startswith("image/"):
+        suffix = ".img"
+    elif mime.startswith("audio/"):
+        suffix = ".audio"
+    elif mime.startswith("text/"):
+        suffix = ".txt"
+
+    path = save_upload(data, "/app/data/uploads", suffix=suffix)
+
+    modality = "file"
+    text: str | None = None
+
+    if mime.startswith("image/"):
+        modality = "image"
+        try:
+            facts = image_basic_facts(path)
+            text = f"IMAGE_FACTS {facts}"
+        except Exception:
+            text = "IMAGE_UPLOAD (facts_unavailable)"
+    elif mime.startswith("audio/"):
+        modality = "audio"
+        text = f"AUDIO_UPLOAD mime={mime} bytes={len(data)}"
+    elif mime.startswith("text/"):
+        modality = "text"
+        try:
+            text = data.decode("utf-8", errors="replace")[:20000]
+        except Exception:
+            text = None
+
+    eid = store.add_experience(
+        user_id=user_id,
+        text=text,
+        source_id=source_id,
+        modality=modality,
+        blob_path=path,
+        mime=mime,
+    )
+    return {"success": True, "experience_id": eid, "modality": modality, "mime": mime}
 
 
 @app.post("/api/curiosity/refresh")

@@ -28,9 +28,12 @@ class Store:
                 CREATE TABLE IF NOT EXISTS sources(
                   id TEXT PRIMARY KEY,
                   created_at REAL NOT NULL,
+                  updated_at REAL,
                   kind TEXT,
                   label TEXT,
                   trust REAL NOT NULL DEFAULT 0.5,
+                  support_count INTEGER NOT NULL DEFAULT 0,
+                  contradict_count INTEGER NOT NULL DEFAULT 0,
                   notes TEXT
                 )
                 """
@@ -105,6 +108,20 @@ class Store:
             )
 
             # lightweight migrations (add columns if upgrading)
+
+            # migrations for sources
+            src_cols = {r[1] for r in c.execute("PRAGMA table_info(sources)").fetchall()}
+            for col, ddl in [
+                ("updated_at", "ALTER TABLE sources ADD COLUMN updated_at REAL"),
+                ("support_count", "ALTER TABLE sources ADD COLUMN support_count INTEGER NOT NULL DEFAULT 0"),
+                ("contradict_count", "ALTER TABLE sources ADD COLUMN contradict_count INTEGER NOT NULL DEFAULT 0"),
+            ]:
+                if col not in src_cols:
+                    try:
+                        c.execute(ddl)
+                    except Exception:
+                        pass
+
             # migrations for experiences
             exp_cols = {r[1] for r in c.execute("PRAGMA table_info(experiences)").fetchall()}
             for col, ddl in [
@@ -138,15 +155,70 @@ class Store:
                     pass
 
     # --- experiences
-    def ensure_source(self, source_id: str, kind: str | None = None, label: str | None = None, trust: float | None = None):
+    def ensure_source(
+        self,
+        source_id: str,
+        kind: str | None = None,
+        label: str | None = None,
+        trust: float | None = None,
+    ):
         with self._conn() as c:
             row = c.execute("SELECT id FROM sources WHERE id=?", (source_id,)).fetchone()
             if row:
                 return
             c.execute(
-                "INSERT INTO sources(id, created_at, kind, label, trust, notes) VALUES(?,?,?,?,?,?)",
-                (source_id, _ts(), kind, label, float(trust) if trust is not None else 0.5, None),
+                "INSERT INTO sources(id, created_at, updated_at, kind, label, trust, support_count, contradict_count, notes) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    source_id,
+                    _ts(),
+                    _ts(),
+                    kind,
+                    label,
+                    float(trust) if trust is not None else 0.5,
+                    0,
+                    0,
+                    None,
+                ),
             )
+
+    def _recompute_source_trust(self, c: sqlite3.Connection, source_id: str):
+        row = c.execute(
+            "SELECT support_count, contradict_count FROM sources WHERE id=?",
+            (source_id,),
+        ).fetchone()
+        if not row:
+            return
+        sup = int(row[0] or 0)
+        con = int(row[1] or 0)
+        # Jeffreys-ish prior: (sup+1)/(sup+con+2)
+        trust = (sup + 1.0) / (sup + con + 2.0)
+        trust = max(0.05, min(0.95, trust))
+        c.execute(
+            "UPDATE sources SET trust=?, updated_at=? WHERE id=?",
+            (trust, _ts(), source_id),
+        )
+
+    def source_bump_support(self, source_id: str, n: int = 1):
+        if not source_id:
+            return
+        with self._conn() as c:
+            self.ensure_source(source_id)
+            c.execute(
+                "UPDATE sources SET support_count = support_count + ?, updated_at=? WHERE id=?",
+                (int(n), _ts(), source_id),
+            )
+            self._recompute_source_trust(c, source_id)
+
+    def source_bump_contradict(self, source_id: str, n: int = 1):
+        if not source_id:
+            return
+        with self._conn() as c:
+            self.ensure_source(source_id)
+            c.execute(
+                "UPDATE sources SET contradict_count = contradict_count + ?, updated_at=? WHERE id=?",
+                (int(n), _ts(), source_id),
+            )
+            self._recompute_source_trust(c, source_id)
 
     def add_experience(
         self,
@@ -300,6 +372,23 @@ class Store:
                     (tid, experience_id, note, now),
                 )
 
+                # governance: bump source support based on experience.source_id
+                try:
+                    if experience_id:
+                        er = c.execute(
+                            "SELECT source_id FROM experiences WHERE id=?",
+                            (int(experience_id),),
+                        ).fetchone()
+                        src = (er[0] if er else None)
+                        if src and not contradicts:
+                            c.execute(
+                                "UPDATE sources SET support_count=support_count+1, updated_at=? WHERE id=?",
+                                (now, src),
+                            )
+                            self._recompute_source_trust(c, src)
+                except Exception:
+                    pass
+
             return tid
 
     # Backwards-compatible alias
@@ -400,6 +489,49 @@ class Store:
             out.append({"subject": subject, "predicate": "(é vs não_é)", "objects": [dict(o) for o in objs]})
 
         return out
+
+    def register_contradiction(self, contradiction: dict[str, Any]):
+        """Update source contradict counts for evidence tied to conflicting triples."""
+        subject = contradiction.get('subject')
+        predicate = contradiction.get('predicate')
+        if not subject or not predicate:
+            return
+
+        # Only applies to normal (s,p) contradictions; skip the synthetic negation key.
+        if predicate == "(é vs não_é)":
+            return
+
+        with self._conn() as c:
+            tids = [
+                int(r[0])
+                for r in c.execute(
+                    "SELECT id FROM triples WHERE subject=? AND predicate=?",
+                    (subject, predicate),
+                ).fetchall()
+            ]
+            if not tids:
+                return
+
+            now = _ts()
+            srcs: set[str] = set()
+            q = """
+                SELECT e.source_id
+                FROM triple_evidence te
+                JOIN experiences e ON e.id = te.experience_id
+                WHERE te.triple_id = ? AND e.source_id IS NOT NULL
+            """
+            for tid in tids:
+                for r in c.execute(q, (tid,)).fetchall():
+                    if r[0]:
+                        srcs.add(str(r[0]))
+
+            for src in srcs:
+                self.ensure_source(src)
+                c.execute(
+                    "UPDATE sources SET contradict_count=contradict_count+1, updated_at=? WHERE id=?",
+                    (now, src),
+                )
+                self._recompute_source_trust(c, src)
 
     def add_synthesis_question_if_needed(self, contradiction: dict[str, Any]):
         subject = contradiction.get('subject')
