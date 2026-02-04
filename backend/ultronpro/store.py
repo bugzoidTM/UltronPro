@@ -28,6 +28,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS experiences(
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   created_at REAL NOT NULL,
+                  processed_at REAL,
                   user_id TEXT,
                   text TEXT NOT NULL
                 )
@@ -76,6 +77,13 @@ class Store:
             )
 
             # lightweight migrations (add columns if upgrading)
+            exp_cols = {r[1] for r in c.execute("PRAGMA table_info(experiences)").fetchall()}
+            if "processed_at" not in exp_cols:
+                try:
+                    c.execute("ALTER TABLE experiences ADD COLUMN processed_at REAL")
+                except Exception:
+                    pass
+
             cols = {r[1] for r in c.execute("PRAGMA table_info(triples)").fetchall()}
             if "updated_at" not in cols:
                 try:
@@ -97,18 +105,30 @@ class Store:
     def add_experience(self, user_id: str | None, text: str) -> int:
         with self._conn() as c:
             cur = c.execute(
-                "INSERT INTO experiences(created_at, user_id, text) VALUES(?,?,?)",
-                (_ts(), user_id, text),
+                "INSERT INTO experiences(created_at, processed_at, user_id, text) VALUES(?,?,?,?)",
+                (_ts(), None, user_id, text),
             )
             return int(cur.lastrowid)
 
     def list_experiences(self, limit: int = 30) -> list[dict[str, Any]]:
         with self._conn() as c:
             rows = c.execute(
-                "SELECT id, created_at, user_id, text FROM experiences ORDER BY id DESC LIMIT ?",
+                "SELECT id, created_at, processed_at, user_id, text FROM experiences ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows][::-1]
+
+    def list_unprocessed_experiences(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, created_at, processed_at, user_id, text FROM experiences WHERE processed_at IS NULL ORDER BY id ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_experience_processed(self, eid: int):
+        with self._conn() as c:
+            c.execute("UPDATE experiences SET processed_at=? WHERE id=?", (_ts(), int(eid)))
 
     # --- questions
     def list_open_questions(self, limit: int = 50) -> list[str]:

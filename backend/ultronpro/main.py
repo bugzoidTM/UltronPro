@@ -30,12 +30,21 @@ async def _autonomous_loop():
     while True:
         try:
             st = store.stats()
+
+            # 1) Batch absorption: process new experiences into triples
+            for e in store.list_unprocessed_experiences(limit=10):
+                triples = extract_triples(e.get('text') or '')
+                for (s, p, o, conf) in triples[:10]:
+                    store.add_or_reinforce_triple(s, p, o, confidence=conf, experience_id=e.get('id'), note="from_experience")
+                store.mark_experience_processed(int(e.get('id')))
+
+            # 2) Maintain curiosity backlog (3 open questions)
             if st.get('questions_open', 0) < 3:
                 exps = store.list_experiences(limit=40)
                 open_q = store.list_open_questions(limit=50)
                 store.add_questions(curiosity.propose(exps, open_q))
 
-            # synthesis questions
+            # 3) Synthesis questions on contradictions
             for c in store.find_contradictions(min_conf=0.6):
                 store.add_synthesis_question_if_needed(c)
         except Exception:
@@ -164,9 +173,11 @@ async def federated_export_signed(since_experience_id: int | None = None):
 
 @app.post("/api/federated/import")
 async def federated_import(req: ImportBundle):
-    # If signature was provided and key exists, require verification.
+    # If key exists, require signature.
     key = _bundle_key()
-    if req.signature and key:
+    if key:
+        if not req.signature:
+            raise HTTPException(status_code=400, detail="Missing signature")
         if not verify_bundle(req.bundle, req.signature, key):
             raise HTTPException(status_code=400, detail="Invalid signature")
 
