@@ -86,6 +86,7 @@ class Store:
                 )
                 """
             )
+            # migrations for events are unnecessary (new table)
             c.execute(
                 """
                 CREATE TABLE IF NOT EXISTS actions(
@@ -1005,17 +1006,33 @@ class Store:
 
     def list_conflicts(self, status: str = 'open', limit: int = 50) -> list[dict[str, Any]]:
         with self._conn() as c:
+            if status == 'open':
+                # norms are allowed to have many variants; don't show them as "conflicts" to humans.
+                where = "status=? AND subject <> 'AGI'"
+            else:
+                where = "status=?"
+
             rows = c.execute(
-                """
+                f"""
                 SELECT id, created_at, updated_at, status, subject, predicate, first_seen_at, last_seen_at, seen_count, last_summary
                 FROM conflicts
-                WHERE status=?
+                WHERE {where}
                 ORDER BY last_seen_at DESC, id DESC
                 LIMIT ?
                 """,
                 (status, int(limit)),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def archive_norm_conflicts(self) -> int:
+        """One-shot cleanup: archive conflicts created from norms (subject='AGI')."""
+        now = _ts()
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE conflicts SET status='archived', updated_at=? WHERE status='open' AND subject='AGI'",
+                (now,),
+            )
+            return int(cur.rowcount or 0)
 
     def get_conflict(self, cid: int) -> dict[str, Any] | None:
         with self._conn() as c:

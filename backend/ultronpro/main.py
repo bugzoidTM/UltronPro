@@ -325,6 +325,12 @@ async def list_conflicts(status: str = 'open', limit: int = 50):
     return {"success": True, "conflicts": store.list_conflicts(status=status, limit=limit)}
 
 
+@app.post("/api/conflicts/cleanup_norms")
+async def cleanup_norm_conflicts():
+    n = store.archive_norm_conflicts()
+    return {"success": True, "archived": n}
+
+
 @app.get("/api/conflicts/{conflict_id}")
 async def get_conflict(conflict_id: int):
     c = store.get_conflict(conflict_id)
