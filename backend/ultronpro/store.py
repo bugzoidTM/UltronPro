@@ -605,6 +605,21 @@ class Store:
     def add_triple(self, subject: str, predicate: str, object_: str, confidence: float = 0.5, experience_id: int | None = None, note: str | None = None) -> int:
         return self.add_or_reinforce_triple(subject, predicate, object_, confidence, experience_id, note)
 
+    def list_norms(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Return compiled norms for gating (subject='AGI')."""
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, subject, predicate, object, confidence
+                FROM triples
+                WHERE subject='AGI'
+                ORDER BY confidence DESC, id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def search_triples(self, q: str, limit: int = 20) -> list[dict[str, Any]]:
         like = f"%{q}%"
         with self._conn() as c:

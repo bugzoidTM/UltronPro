@@ -16,6 +16,7 @@ from ultronpro.media import save_upload
 from ultronpro.perception import image_basic_facts
 from ultronpro.federated import export_bundle, import_bundle
 from ultronpro.signing import sign_bundle, verify_bundle
+from ultronpro.policy import evaluate_action
 
 
 store = Store("/app/data/ultronpro.sqlite")
@@ -225,6 +226,11 @@ async def list_laws(status: str = 'active', limit: int = 50):
     return {"success": True, "laws": store.list_laws(status=status, limit=limit)}
 
 
+@app.get("/api/norms")
+async def list_norms(limit: int = 200):
+    return {"success": True, "norms": store.list_norms(limit=limit)}
+
+
 @app.post("/api/laws/{law_id}/archive")
 async def archive_law(law_id: int):
     store.archive_law(law_id)
@@ -239,6 +245,23 @@ class MigrateLawsReq(BaseModel):
 async def migrate_laws(req: MigrateLawsReq):
     res = store.migrate_text_experiences_to_laws(limit=req.limit)
     return {"success": True, **res}
+
+
+class PolicyCheckReq(BaseModel):
+    text: str = Field(..., min_length=1, max_length=10000)
+
+
+@app.post("/api/policy/check")
+async def policy_check(req: PolicyCheckReq):
+    norms = store.list_norms(limit=200)
+    v = evaluate_action(req.text, norms)
+    return {
+        "success": True,
+        "allowed": v.allowed,
+        "score": v.score,
+        "reasons": v.reasons,
+        "matched_norms": v.matched_norms,
+    }
 
 
 @app.get("/api/conflicts")
