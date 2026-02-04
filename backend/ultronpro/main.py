@@ -231,6 +231,16 @@ async def archive_law(law_id: int):
     return {"success": True}
 
 
+class MigrateLawsReq(BaseModel):
+    limit: int = Field(default=200, ge=1, le=5000)
+
+
+@app.post("/api/laws/migrate")
+async def migrate_laws(req: MigrateLawsReq):
+    res = store.migrate_text_experiences_to_laws(limit=req.limit)
+    return {"success": True, **res}
+
+
 @app.get("/api/conflicts")
 async def list_conflicts(status: str = 'open', limit: int = 50):
     return {"success": True, "conflicts": store.list_conflicts(status=status, limit=limit)}

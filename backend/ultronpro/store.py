@@ -62,7 +62,8 @@ class Store:
                   status TEXT NOT NULL, -- active|archived
                   title TEXT,
                   text TEXT NOT NULL,
-                  source_id TEXT
+                  source_id TEXT,
+                  source_experience_id INTEGER
                 )
                 """
             )
@@ -169,6 +170,15 @@ class Store:
             )
 
             # lightweight migrations (add columns if upgrading)
+
+            # migrations for laws
+            if c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='laws'").fetchone():
+                law_cols = {r[1] for r in c.execute("PRAGMA table_info(laws)").fetchall()}
+                if "source_experience_id" not in law_cols:
+                    try:
+                        c.execute("ALTER TABLE laws ADD COLUMN source_experience_id INTEGER")
+                    except Exception:
+                        pass
 
             # migrations for sources
             src_cols = {r[1] for r in c.execute("PRAGMA table_info(sources)").fetchall()}
@@ -331,17 +341,95 @@ class Store:
             c.execute("UPDATE experiences SET processed_at=? WHERE id=?", (_ts(), int(eid)))
 
     # --- laws
-    def add_law(self, text: str, title: str | None = None, source_id: str | None = None) -> int:
+    def add_law(
+        self,
+        text: str,
+        title: str | None = None,
+        source_id: str | None = None,
+        source_experience_id: int | None = None,
+    ) -> int:
         text = (text or '').strip()
         if not text:
             raise ValueError('empty law')
         now = _ts()
         with self._conn() as c:
+            # de-dupe: if identical text already exists, return its id
+            row = c.execute(
+                "SELECT id FROM laws WHERE text=? AND status='active' ORDER BY id DESC LIMIT 1",
+                (text,),
+            ).fetchone()
+            if row:
+                return int(row[0])
+
             cur = c.execute(
-                "INSERT INTO laws(created_at,updated_at,status,title,text,source_id) VALUES(?,?,?,?,?,?)",
-                (now, now, 'active', title, text, source_id),
+                "INSERT INTO laws(created_at,updated_at,status,title,text,source_id,source_experience_id) VALUES(?,?,?,?,?,?,?)",
+                (now, now, 'active', title, text, source_id, source_experience_id),
             )
             return int(cur.lastrowid)
+
+    def migrate_text_experiences_to_laws(self, limit: int = 200) -> dict[str, Any]:
+        """Heuristically promote old text experiences into 'law' modality + laws table.
+
+        Also marks them for reprocessing by setting processed_at=NULL.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, text, source_id, modality
+                FROM experiences
+                WHERE (modality IS NULL OR modality='text')
+                  AND text IS NOT NULL
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+
+            promoted = 0
+            skipped = 0
+            for r in rows:
+                eid = int(r[0])
+                text = (r[1] or '').strip()
+                source_id = r[2]
+                if len(text) < 80:
+                    skipped += 1
+                    continue
+
+                t0 = text.lstrip()[:200].lower()
+                # law-ish heuristics (PT)
+                lawish = (
+                    "lei" in t0
+                    or "você deve" in t0
+                    or t0.startswith("busque ")
+                    or t0.startswith("valorize ")
+                    or t0.startswith("reconheça ")
+                    or t0.startswith("interprete ")
+                    or t0.startswith("não ")
+                    or "não " in t0
+                    or "autonomia" in t0
+                    or "não causar dano" in t0
+                )
+                if not lawish:
+                    skipped += 1
+                    continue
+
+                # best-effort title: first line
+                first_line = text.splitlines()[0].strip() if text.splitlines() else None
+                title = None
+                if first_line and len(first_line) <= 80:
+                    title = first_line
+
+                # insert/merge into laws
+                self.add_law(text, title=title, source_id=source_id, source_experience_id=eid)
+
+                # promote modality and reprocess
+                c.execute(
+                    "UPDATE experiences SET modality='law', processed_at=NULL WHERE id=?",
+                    (eid,),
+                )
+                promoted += 1
+
+            return {"promoted": promoted, "skipped": skipped, "scanned": len(rows)}
 
     def list_laws(self, status: str = 'active', limit: int = 50) -> list[dict[str, Any]]:
         with self._conn() as c:
