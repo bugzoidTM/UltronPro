@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from fastapi import UploadFile, File
 
 from ultronpro.store import Store
 from ultronpro.curiosity import CuriosityProcessor
@@ -64,7 +65,9 @@ app = FastAPI(title="UltronPRO", version="0.1.0", lifespan=lifespan)
 
 class Ingest(BaseModel):
     user_id: str | None = None
-    text: str = Field(..., min_length=1, max_length=20000)
+    source_id: str | None = None
+    modality: str = Field(default="text")
+    text: str | None = Field(default=None, max_length=20000)
 
 
 class Answer(BaseModel):
@@ -83,7 +86,7 @@ async def status():
 
 @app.post("/api/ingest")
 async def ingest(req: Ingest):
-    eid = store.add_experience(req.user_id, req.text)
+    eid = store.add_experience(req.user_id, req.text, source_id=req.source_id, modality=req.modality)
 
     # Auto-curiosidade: após ingerir, mantenha pelo menos 3 perguntas abertas.
     st = store.stats()

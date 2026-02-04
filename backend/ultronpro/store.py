@@ -25,12 +25,40 @@ class Store:
         with self._conn() as c:
             c.execute(
                 """
+                CREATE TABLE IF NOT EXISTS sources(
+                  id TEXT PRIMARY KEY,
+                  created_at REAL NOT NULL,
+                  kind TEXT,
+                  label TEXT,
+                  trust REAL NOT NULL DEFAULT 0.5,
+                  notes TEXT
+                )
+                """
+            )
+            c.execute(
+                """
                 CREATE TABLE IF NOT EXISTS experiences(
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   created_at REAL NOT NULL,
                   processed_at REAL,
                   user_id TEXT,
-                  text TEXT NOT NULL
+                  source_id TEXT,
+                  modality TEXT NOT NULL DEFAULT 'text',
+                  text TEXT,
+                  blob_path TEXT,
+                  mime TEXT
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS goals(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  created_at REAL NOT NULL,
+                  status TEXT NOT NULL, -- open|active|done|archived
+                  title TEXT NOT NULL,
+                  description TEXT,
+                  priority INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -77,12 +105,20 @@ class Store:
             )
 
             # lightweight migrations (add columns if upgrading)
+            # migrations for experiences
             exp_cols = {r[1] for r in c.execute("PRAGMA table_info(experiences)").fetchall()}
-            if "processed_at" not in exp_cols:
-                try:
-                    c.execute("ALTER TABLE experiences ADD COLUMN processed_at REAL")
-                except Exception:
-                    pass
+            for col, ddl in [
+                ("processed_at", "ALTER TABLE experiences ADD COLUMN processed_at REAL"),
+                ("source_id", "ALTER TABLE experiences ADD COLUMN source_id TEXT"),
+                ("modality", "ALTER TABLE experiences ADD COLUMN modality TEXT NOT NULL DEFAULT 'text'"),
+                ("blob_path", "ALTER TABLE experiences ADD COLUMN blob_path TEXT"),
+                ("mime", "ALTER TABLE experiences ADD COLUMN mime TEXT"),
+            ]:
+                if col not in exp_cols:
+                    try:
+                        c.execute(ddl)
+                    except Exception:
+                        pass
 
             cols = {r[1] for r in c.execute("PRAGMA table_info(triples)").fetchall()}
             if "updated_at" not in cols:
@@ -102,18 +138,36 @@ class Store:
                     pass
 
     # --- experiences
-    def add_experience(self, user_id: str | None, text: str) -> int:
+    def ensure_source(self, source_id: str, kind: str | None = None, label: str | None = None, trust: float | None = None):
+        with self._conn() as c:
+            row = c.execute("SELECT id FROM sources WHERE id=?", (source_id,)).fetchone()
+            if row:
+                return
+            c.execute(
+                "INSERT INTO sources(id, created_at, kind, label, trust, notes) VALUES(?,?,?,?,?,?)",
+                (source_id, _ts(), kind, label, float(trust) if trust is not None else 0.5, None),
+            )
+
+    def add_experience(
+        self,
+        user_id: str | None,
+        text: str | None,
+        source_id: str | None = None,
+        modality: str = "text",
+        blob_path: str | None = None,
+        mime: str | None = None,
+    ) -> int:
         with self._conn() as c:
             cur = c.execute(
-                "INSERT INTO experiences(created_at, processed_at, user_id, text) VALUES(?,?,?,?)",
-                (_ts(), None, user_id, text),
+                "INSERT INTO experiences(created_at, processed_at, user_id, source_id, modality, text, blob_path, mime) VALUES(?,?,?,?,?,?,?,?)",
+                (_ts(), None, user_id, source_id, modality, text, blob_path, mime),
             )
             return int(cur.lastrowid)
 
     def list_experiences(self, limit: int = 30) -> list[dict[str, Any]]:
         with self._conn() as c:
             rows = c.execute(
-                "SELECT id, created_at, processed_at, user_id, text FROM experiences ORDER BY id DESC LIMIT ?",
+                "SELECT id, created_at, processed_at, user_id, source_id, modality, text, blob_path, mime FROM experiences ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows][::-1]
@@ -121,7 +175,7 @@ class Store:
     def list_unprocessed_experiences(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._conn() as c:
             rows = c.execute(
-                "SELECT id, created_at, processed_at, user_id, text FROM experiences WHERE processed_at IS NULL ORDER BY id ASC LIMIT ?",
+                "SELECT id, created_at, processed_at, user_id, source_id, modality, text, blob_path, mime FROM experiences WHERE processed_at IS NULL ORDER BY id ASC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
