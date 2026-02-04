@@ -78,7 +78,9 @@ class Store:
                   first_seen_at REAL NOT NULL,
                   last_seen_at REAL NOT NULL,
                   seen_count INTEGER NOT NULL DEFAULT 1,
-                  last_summary TEXT
+                  last_summary TEXT,
+                  last_question_at REAL,
+                  question_count INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -93,6 +95,20 @@ class Store:
                   first_seen_at REAL NOT NULL,
                   last_seen_at REAL NOT NULL,
                   seen_count INTEGER NOT NULL DEFAULT 1,
+                  FOREIGN KEY(conflict_id) REFERENCES conflicts(id)
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conflict_resolutions(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  conflict_id INTEGER NOT NULL,
+                  created_at REAL NOT NULL,
+                  decided_by TEXT,
+                  chosen_object TEXT,
+                  resolution_text TEXT,
+                  notes TEXT,
                   FOREIGN KEY(conflict_id) REFERENCES conflicts(id)
                 )
                 """
@@ -170,8 +186,17 @@ class Store:
                         pass
 
             # migrations for conflicts
-            conf_cols = {r[1] for r in c.execute("PRAGMA table_info(conflicts)").fetchall()} if c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='conflicts'").fetchone() else set()
-            # (for initial versions, table is created above; keep future-proof here)
+            if c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='conflicts'").fetchone():
+                conf_cols = {r[1] for r in c.execute("PRAGMA table_info(conflicts)").fetchall()}
+                for col, ddl in [
+                    ("last_question_at", "ALTER TABLE conflicts ADD COLUMN last_question_at REAL"),
+                    ("question_count", "ALTER TABLE conflicts ADD COLUMN question_count INTEGER NOT NULL DEFAULT 0"),
+                ]:
+                    if col not in conf_cols:
+                        try:
+                            c.execute(ddl)
+                        except Exception:
+                            pass
 
             cols = {r[1] for r in c.execute("PRAGMA table_info(triples)").fetchall()}
             if "updated_at" not in cols:
@@ -569,8 +594,11 @@ class Store:
                 )
                 self._recompute_source_trust(c, src)
 
-    def upsert_conflict(self, contradiction: dict[str, Any]) -> int | None:
-        """Persist 'doubt' about a contradiction so it doesn't evaporate."""
+    def upsert_conflict(self, contradiction: dict[str, Any]) -> dict[str, Any] | None:
+        """Persist 'doubt' about a contradiction so it doesn't evaporate.
+
+        Returns: {id, is_new, has_new_variant}
+        """
         subject = (contradiction.get('subject') or '').strip()
         predicate = (contradiction.get('predicate') or '').strip()
         objs = contradiction.get('objects') or []
@@ -587,23 +615,27 @@ class Store:
         opts = ", ".join((o.get('object') or '') for o in objs if o.get('object'))
         summary = f"{subject} {predicate} -> {opts}"[:500]
 
+        is_new = False
+        has_new_variant = False
+
         with self._conn() as c:
             row = c.execute(
-                "SELECT id, first_seen_at, seen_count FROM conflicts WHERE key=? AND status='open' ORDER BY id DESC LIMIT 1",
+                "SELECT id, seen_count FROM conflicts WHERE key=? AND status='open' ORDER BY id DESC LIMIT 1",
                 (key,),
             ).fetchone()
 
             if row:
                 cid = int(row[0])
-                seen = int(row[2] or 1) + 1
+                seen = int(row[1] or 1) + 1
                 c.execute(
                     "UPDATE conflicts SET updated_at=?, last_seen_at=?, seen_count=?, last_summary=? WHERE id=?",
                     (now, now, seen, summary, cid),
                 )
             else:
+                is_new = True
                 cur = c.execute(
-                    "INSERT INTO conflicts(created_at,updated_at,status,subject,predicate,key,first_seen_at,last_seen_at,seen_count,last_summary) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (now, now, 'open', subject, predicate, key, now, now, 1, summary),
+                    "INSERT INTO conflicts(created_at,updated_at,status,subject,predicate,key,first_seen_at,last_seen_at,seen_count,last_summary,last_question_at,question_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (now, now, 'open', subject, predicate, key, now, now, 1, summary, None, 0),
                 )
                 cid = int(cur.lastrowid)
 
@@ -626,12 +658,13 @@ class Store:
                         (now, vseen, conf, tid, vid),
                     )
                 else:
+                    has_new_variant = True
                     c.execute(
                         "INSERT INTO conflict_variants(conflict_id,triple_id,object,confidence,first_seen_at,last_seen_at,seen_count) VALUES(?,?,?,?,?,?,?)",
                         (cid, tid, obj, conf, now, now, 1),
                     )
 
-            return cid
+            return {"id": cid, "is_new": is_new, "has_new_variant": has_new_variant}
 
     def list_conflicts(self, status: str = 'open', limit: int = 50) -> list[dict[str, Any]]:
         with self._conn() as c:
@@ -668,13 +701,84 @@ class Store:
         out['variants'] = [dict(v) for v in variants]
         return out
 
-    def resolve_conflict(self, cid: int, resolution: str | None = None):
+    def resolve_conflict(
+        self,
+        cid: int,
+        resolution: str | None = None,
+        chosen_object: str | None = None,
+        decided_by: str | None = None,
+        notes: str | None = None,
+    ):
         now = _ts()
         with self._conn() as c:
+            # store resolution record
+            c.execute(
+                "INSERT INTO conflict_resolutions(conflict_id, created_at, decided_by, chosen_object, resolution_text, notes) VALUES(?,?,?,?,?,?)",
+                (int(cid), now, decided_by, chosen_object, resolution, notes),
+            )
+
+            # mark resolved
             c.execute(
                 "UPDATE conflicts SET status='resolved', updated_at=?, last_summary=COALESCE(?, last_summary) WHERE id=?",
                 (now, resolution, int(cid)),
             )
+
+            # governance: reward sources supporting chosen_object, penalize sources supporting other variants
+            if chosen_object:
+                conf = c.execute(
+                    "SELECT subject, predicate FROM conflicts WHERE id=?",
+                    (int(cid),),
+                ).fetchone()
+                if conf:
+                    subject, predicate = conf[0], conf[1]
+                    # find triple ids for chosen & other
+                    chosen_tids = [
+                        int(r[0])
+                        for r in c.execute(
+                            "SELECT id FROM triples WHERE subject=? AND predicate=? AND object=?",
+                            (subject, predicate, chosen_object),
+                        ).fetchall()
+                    ]
+                    other_tids = [
+                        int(r[0])
+                        for r in c.execute(
+                            "SELECT id FROM triples WHERE subject=? AND predicate=? AND object<>?",
+                            (subject, predicate, chosen_object),
+                        ).fetchall()
+                    ]
+
+                    def sources_for_tids(tids: list[int]) -> set[str]:
+                        srcs: set[str] = set()
+                        q = """
+                            SELECT DISTINCT e.source_id
+                            FROM triple_evidence te
+                            JOIN experiences e ON e.id = te.experience_id
+                            WHERE te.triple_id = ? AND e.source_id IS NOT NULL
+                        """
+                        for tid in tids:
+                            for r in c.execute(q, (int(tid),)).fetchall():
+                                if r[0]:
+                                    srcs.add(str(r[0]))
+                        return srcs
+
+                    chosen_srcs = sources_for_tids(chosen_tids)
+                    other_srcs = sources_for_tids(other_tids)
+
+                    for src in chosen_srcs:
+                        self.ensure_source(src)
+                        c.execute(
+                            "UPDATE sources SET support_count=support_count+1, updated_at=? WHERE id=?",
+                            (now, src),
+                        )
+                        self._recompute_source_trust(c, src)
+
+                    for src in (other_srcs - chosen_srcs):
+                        self.ensure_source(src)
+                        c.execute(
+                            "UPDATE sources SET contradict_count=contradict_count+1, updated_at=? WHERE id=?",
+                            (now, src),
+                        )
+                        self._recompute_source_trust(c, src)
 
     def archive_conflict(self, cid: int):
         now = _ts()
@@ -682,6 +786,27 @@ class Store:
             c.execute(
                 "UPDATE conflicts SET status='archived', updated_at=? WHERE id=?",
                 (now, int(cid)),
+            )
+
+    def should_prompt_conflict(self, conflict_id: int, *, is_new: bool, has_new_variant: bool, cooldown_hours: float = 12.0) -> bool:
+        if is_new or has_new_variant:
+            return True
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT last_question_at FROM conflicts WHERE id=?",
+                (int(conflict_id),),
+            ).fetchone()
+        lastq = float(row[0]) if row and row[0] is not None else None
+        if lastq is None:
+            return True
+        return (_ts() - lastq) >= (cooldown_hours * 3600.0)
+
+    def mark_conflict_questioned(self, conflict_id: int):
+        now = _ts()
+        with self._conn() as c:
+            c.execute(
+                "UPDATE conflicts SET last_question_at=?, question_count=question_count+1, updated_at=? WHERE id=?",
+                (now, now, int(conflict_id)),
             )
 
     def add_synthesis_question_if_needed(self, contradiction: dict[str, Any], conflict_id: int | None = None):
@@ -703,3 +828,5 @@ class Store:
 
         q = f"(síntese) Encontrei contradição: '{subject}' {predicate} -> {opts}. Qual é a formulação correta? Em que contexto cada uma vale?"
         self.add_questions([{ "question": q, "context": ctx, "priority": 5 }])
+        if conflict_id:
+            self.mark_conflict_questioned(int(conflict_id))

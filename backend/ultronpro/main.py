@@ -50,8 +50,11 @@ async def _autonomous_loop():
             # 3) Synthesis questions on contradictions + persisted doubt + source governance
             for c in store.find_contradictions(min_conf=0.6):
                 store.register_contradiction(c)
-                cid = store.upsert_conflict(c)
-                store.add_synthesis_question_if_needed(c, conflict_id=cid)
+                info = store.upsert_conflict(c)
+                if info:
+                    cid = int(info['id'])
+                    if store.should_prompt_conflict(cid, is_new=bool(info.get('is_new')), has_new_variant=bool(info.get('has_new_variant')), cooldown_hours=12.0):
+                        store.add_synthesis_question_if_needed(c, conflict_id=cid)
         except Exception:
             pass
         await asyncio.sleep(20)
@@ -213,11 +216,20 @@ async def get_conflict(conflict_id: int):
 
 class ResolveConflict(BaseModel):
     resolution: str | None = Field(default=None, max_length=2000)
+    chosen_object: str | None = Field(default=None, max_length=500)
+    decided_by: str | None = Field(default=None, max_length=200)
+    notes: str | None = Field(default=None, max_length=2000)
 
 
 @app.post("/api/conflicts/{conflict_id}/resolve")
 async def resolve_conflict(conflict_id: int, req: ResolveConflict):
-    store.resolve_conflict(conflict_id, resolution=req.resolution)
+    store.resolve_conflict(
+        conflict_id,
+        resolution=req.resolution,
+        chosen_object=req.chosen_object,
+        decided_by=req.decided_by,
+        notes=req.notes,
+    )
     return {"success": True}
 
 
