@@ -17,8 +17,15 @@ class Store:
         self._init()
 
     def _conn(self) -> sqlite3.Connection:
-        c = sqlite3.connect(str(self.path))
+        # timeout reduces "database is locked" under concurrent loop + API usage
+        c = sqlite3.connect(str(self.path), timeout=30)
         c.row_factory = sqlite3.Row
+        try:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=NORMAL")
+            c.execute("PRAGMA busy_timeout=5000")
+        except Exception:
+            pass
         return c
 
     def _init(self):
@@ -371,8 +378,14 @@ class Store:
         """Heuristically promote old text experiences into 'law' modality + laws table.
 
         Also marks them for reprocessing by setting processed_at=NULL.
+        Runs in a single connection/transaction to reduce lock contention.
         """
         with self._conn() as c:
+            try:
+                c.execute("BEGIN IMMEDIATE")
+            except Exception:
+                pass
+
             rows = c.execute(
                 """
                 SELECT id, text, source_id, modality
@@ -419,8 +432,16 @@ class Store:
                 if first_line and len(first_line) <= 80:
                     title = first_line
 
-                # insert/merge into laws
-                self.add_law(text, title=title, source_id=source_id, source_experience_id=eid)
+                # insert/merge into laws (avoid nested connections)
+                row2 = c.execute(
+                    "SELECT id FROM laws WHERE text=? AND status='active' ORDER BY id DESC LIMIT 1",
+                    (text,),
+                ).fetchone()
+                if not row2:
+                    c.execute(
+                        "INSERT INTO laws(created_at,updated_at,status,title,text,source_id,source_experience_id) VALUES(?,?,?,?,?,?,?)",
+                        (now, now, 'active', title, text, source_id, eid),
+                    )
 
                 # promote modality and reprocess
                 c.execute(
