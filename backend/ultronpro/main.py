@@ -18,6 +18,7 @@ from ultronpro.federated import export_bundle, import_bundle
 from ultronpro.signing import sign_bundle, verify_bundle
 from ultronpro.policy import evaluate_action
 from ultronpro.planner import propose_actions
+from ultronpro import autofeeder
 import json
 
 
@@ -72,7 +73,22 @@ async def _autonomous_loop():
                     ):
                         store.add_synthesis_question_if_needed(c, conflict_id=cid)
 
-            # 4) Planner/Executor: propose internal actions and run them through policy gate
+            # 4) Auto-feeder: ingest knowledge from public sources automatically
+            try:
+                feed = autofeeder.fetch_next()
+                if feed:
+                    store.ensure_source(feed.source_id, kind="autofeeder", label=feed.source_id)
+                    eid = store.add_experience(
+                        user_id="autofeeder",
+                        text=feed.text,
+                        source_id=feed.source_id,
+                        modality=feed.modality,
+                    )
+                    store.add_event('autofeed', f"📥 {feed.source_id}: {(feed.title or feed.text)[:60]}")
+            except Exception:
+                pass
+
+            # 5) Planner/Executor: propose internal actions and run them through policy gate
             act = store.next_action()
             if not act:
                 for pa in propose_actions(store):
