@@ -283,6 +283,36 @@ async function archiveConflict(id){
   }catch(e){ setCMsg('❌ '+e.message); }
 }
 
+async function doSearch(){
+  const q = document.getElementById('searchQ').value;
+  const box = document.getElementById('searchResults');
+  if(!q) return;
+  box.innerHTML = '<div class="muted">Buscando significado...</div>';
+  try{
+    const j = await jfetch('/api/search/semantic', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({query:q, top_k:10})});
+    const res = j.results || [];
+    if(!res.length) { box.innerHTML = '<div class="muted">Nada encontrado.</div>'; return; }
+    
+    box.innerHTML = res.map(r => {
+      const score = (r.score||0).toFixed(3);
+      if(r.type === 'experience') {
+        return `<div style="margin-bottom:8px;padding:8px;background:#1e293b;border-radius:8px">
+          <div style="font-weight:bold;color:#60a5fa">Experiência <span class="muted">(${score})</span></div>
+          <div style="font-size:13px;margin-top:4px">${esc(r.text)}</div>
+          <div class="muted" style="font-size:11px">${esc(r.source_id||'unknown')}</div>
+        </div>`;
+      } else {
+        return `<div style="margin-bottom:8px;padding:8px;background:#1e293b;border-radius:8px">
+          <div style="font-weight:bold;color:#a78bfa">Tripla <span class="muted">(${score})</span></div>
+          <div style="font-size:13px;margin-top:4px">${esc(r.subject)} <b>${esc(r.predicate)}</b> ${esc(r.object)}</div>
+        </div>`;
+      }
+    }).join('');
+  }catch(e){
+    box.innerHTML = '<div style="color:red">Erro: '+e.message+'</div>';
+  }
+}
+
 async function load(){
   const st = await jfetch('/api/status');
   document.getElementById('status').textContent = JSON.stringify(st, null, 2);

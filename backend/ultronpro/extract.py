@@ -5,15 +5,20 @@ from typing import Iterable
 
 
 # Very small, deterministic extractor. We keep it simple on purpose.
+# Now relaxed to find patterns inside sentences, not just full-line matches.
 _PATTERNS: list[tuple[re.Pattern, str]] = [
     # "X não é Y" (explicit negation)
-    (re.compile(r"^\s*([^\n\r]{1,80}?)\s+n[ãa]o\s+é\s+([^\n\r]{1,120}?)\s*\.?$", re.IGNORECASE), "não_é"),
+    (re.compile(r"([A-ZÀ-ÿ][^\n\r]{1,50}?)\s+n[ãa]o\s+é\s+([^\n\r]{1,100}?)[\.,;]", re.IGNORECASE), "não_é"),
     # "X é Y"
-    (re.compile(r"^\s*([^\n\r]{1,80}?)\s+é\s+([^\n\r]{1,120}?)\s*\.?$", re.IGNORECASE), "é"),
+    (re.compile(r"([A-ZÀ-ÿ][^\n\r]{1,50}?)\s+é\s+([^\n\r]{1,100}?)[\.,;]", re.IGNORECASE), "é"),
+    # "X são Y"
+    (re.compile(r"([A-ZÀ-ÿ][^\n\r]{1,50}?)\s+são\s+([^\n\r]{1,100}?)[\.,;]", re.IGNORECASE), "são"),
     # "X tem Y"
-    (re.compile(r"^\s*([^\n\r]{1,80}?)\s+tem\s+([^\n\r]{1,120}?)\s*\.?$", re.IGNORECASE), "tem"),
+    (re.compile(r"([A-ZÀ-ÿ][^\n\r]{1,50}?)\s+tem\s+([^\n\r]{1,100}?)[\.,;]", re.IGNORECASE), "tem"),
+    # "X constitui Y"
+    (re.compile(r"([A-ZÀ-ÿ][^\n\r]{1,50}?)\s+constitui-?se?\s+([^\n\r]{1,100}?)[\.,;]", re.IGNORECASE), "constitui"),
     # "X significa Y"
-    (re.compile(r"^\s*([^\n\r]{1,80}?)\s+significa\s+([^\n\r]{1,120}?)\s*\.?$", re.IGNORECASE), "significa"),
+    (re.compile(r"([A-ZÀ-ÿ][^\n\r]{1,50}?)\s+significa\s+([^\n\r]{1,100}?)[\.,;]", re.IGNORECASE), "significa"),
 ]
 
 
