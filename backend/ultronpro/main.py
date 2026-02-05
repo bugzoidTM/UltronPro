@@ -19,11 +19,43 @@ from ultronpro.signing import sign_bundle, verify_bundle
 from ultronpro.policy import evaluate_action
 from ultronpro.planner import propose_actions
 from ultronpro import autofeeder
+from ultronpro import embeddings as emb
 import json
 
 
 store = Store("/app/data/ultronpro.sqlite")
 curiosity = CuriosityProcessor()
+
+# Lazy flag to avoid loading model on every loop iteration
+_embeddings_ready = False
+
+
+def _ensure_embeddings():
+    """Generate embeddings for experiences/triples that don't have them yet."""
+    global _embeddings_ready
+    
+    # Process up to 10 experiences without embeddings
+    exps = store.list_experiences_without_embeddings(limit=10)
+    for e in exps:
+        try:
+            txt = e.get('text') or ''
+            if len(txt) > 10:
+                vec = emb.embed_text(txt[:2000])
+                store.update_experience_embedding(int(e['id']), emb.embedding_to_json(vec))
+        except Exception:
+            pass
+    
+    # Process up to 10 triples without embeddings
+    triples = store.list_triples_without_embeddings(limit=10)
+    for t in triples:
+        try:
+            text = f"{t.get('subject')} {t.get('predicate')} {t.get('object')}"
+            vec = emb.embed_text(text)
+            store.update_triple_embedding(int(t['id']), emb.embedding_to_json(vec))
+        except Exception:
+            pass
+    
+    _embeddings_ready = True
 
 
 async def _autonomous_loop():
@@ -88,7 +120,13 @@ async def _autonomous_loop():
             except Exception:
                 pass
 
-            # 5) Planner/Executor: propose internal actions and run them through policy gate
+            # 5) Generate embeddings for experiences/triples (lazy, incremental)
+            try:
+                _ensure_embeddings()
+            except Exception:
+                pass
+
+            # 6) Planner/Executor: propose internal actions and run them through policy gate
             act = store.next_action()
             if not act:
                 for pa in propose_actions(store):
@@ -301,6 +339,62 @@ async def actions(limit: int = 50):
 @app.get("/api/events")
 async def events(since_id: int = 0, limit: int = 100):
     return {"success": True, "events": store.list_events(since_id=since_id, limit=limit)}
+
+
+class SemanticSearchReq(BaseModel):
+    query: str = Field(..., min_length=1, max_length=2000)
+    top_k: int = Field(default=10, ge=1, le=50)
+    min_score: float = Field(default=0.3, ge=0.0, le=1.0)
+    search_type: str = Field(default="all")  # "all" | "experiences" | "triples"
+
+
+@app.post("/api/search/semantic")
+async def semantic_search(req: SemanticSearchReq):
+    """Semantic search over experiences and triples using embeddings."""
+    try:
+        query_vec = emb.embed_text(req.query)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Embedding error: {e}")
+
+    results = []
+
+    if req.search_type in ("all", "experiences"):
+        exps = store.list_experiences_with_embeddings(limit=500)
+        for e in exps:
+            vec = emb.embedding_from_json(e.get("embedding_json"))
+            if vec:
+                score = emb.cosine_similarity(query_vec, vec)
+                if score >= req.min_score:
+                    results.append({
+                        "type": "experience",
+                        "id": e.get("id"),
+                        "text": (e.get("text") or "")[:500],
+                        "source_id": e.get("source_id"),
+                        "score": round(score, 4),
+                    })
+
+    if req.search_type in ("all", "triples"):
+        triples = store.list_triples_with_embeddings(limit=500)
+        for t in triples:
+            vec = emb.embedding_from_json(t.get("embedding_json"))
+            if vec:
+                score = emb.cosine_similarity(query_vec, vec)
+                if score >= req.min_score:
+                    results.append({
+                        "type": "triple",
+                        "id": t.get("id"),
+                        "subject": t.get("subject"),
+                        "predicate": t.get("predicate"),
+                        "object": t.get("object"),
+                        "confidence": t.get("confidence"),
+                        "score": round(score, 4),
+                    })
+
+    # Sort by score descending and limit
+    results.sort(key=lambda x: x["score"], reverse=True)
+    results = results[:req.top_k]
+
+    return {"success": True, "results": results, "query": req.query}
 
 
 @app.post("/api/laws/{law_id}/archive")

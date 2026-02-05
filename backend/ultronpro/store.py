@@ -56,7 +56,8 @@ class Store:
                   modality TEXT NOT NULL DEFAULT 'text',
                   text TEXT,
                   blob_path TEXT,
-                  mime TEXT
+                  mime TEXT,
+                  embedding_json TEXT
                 )
                 """
             )
@@ -189,7 +190,8 @@ class Store:
                   object TEXT NOT NULL,
                   confidence REAL NOT NULL DEFAULT 0.5,
                   support_count INTEGER NOT NULL DEFAULT 1,
-                  contradict_count INTEGER NOT NULL DEFAULT 0
+                  contradict_count INTEGER NOT NULL DEFAULT 0,
+                  embedding_json TEXT
                 )
                 """
             )
@@ -243,6 +245,7 @@ class Store:
                 ("modality", "ALTER TABLE experiences ADD COLUMN modality TEXT NOT NULL DEFAULT 'text'"),
                 ("blob_path", "ALTER TABLE experiences ADD COLUMN blob_path TEXT"),
                 ("mime", "ALTER TABLE experiences ADD COLUMN mime TEXT"),
+                ("embedding_json", "ALTER TABLE experiences ADD COLUMN embedding_json TEXT"),
             ]:
                 if col not in exp_cols:
                     try:
@@ -277,6 +280,11 @@ class Store:
             if "contradict_count" not in cols:
                 try:
                     c.execute("ALTER TABLE triples ADD COLUMN contradict_count INTEGER NOT NULL DEFAULT 0")
+                except Exception:
+                    pass
+            if "embedding_json" not in cols:
+                try:
+                    c.execute("ALTER TABLE triples ADD COLUMN embedding_json TEXT")
                 except Exception:
                     pass
 
@@ -364,21 +372,42 @@ class Store:
         modality: str = "text",
         blob_path: str | None = None,
         mime: str | None = None,
+        embedding_json: str | None = None,
     ) -> int:
         with self._conn() as c:
             cur = c.execute(
-                "INSERT INTO experiences(created_at, processed_at, user_id, source_id, modality, text, blob_path, mime) VALUES(?,?,?,?,?,?,?,?)",
-                (_ts(), None, user_id, source_id, modality, text, blob_path, mime),
+                "INSERT INTO experiences(created_at, processed_at, user_id, source_id, modality, text, blob_path, mime, embedding_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                (_ts(), None, user_id, source_id, modality, text, blob_path, mime, embedding_json),
             )
             return int(cur.lastrowid)
+
+    def update_experience_embedding(self, eid: int, embedding_json: str):
+        with self._conn() as c:
+            c.execute("UPDATE experiences SET embedding_json=? WHERE id=?", (embedding_json, int(eid)))
 
     def list_experiences(self, limit: int = 30) -> list[dict[str, Any]]:
         with self._conn() as c:
             rows = c.execute(
-                "SELECT id, created_at, processed_at, user_id, source_id, modality, text, blob_path, mime FROM experiences ORDER BY id DESC LIMIT ?",
+                "SELECT id, created_at, processed_at, user_id, source_id, modality, text, blob_path, mime, embedding_json FROM experiences ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows][::-1]
+
+    def list_experiences_with_embeddings(self, limit: int = 500) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, created_at, user_id, source_id, modality, text, embedding_json FROM experiences WHERE embedding_json IS NOT NULL ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_experiences_without_embeddings(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, text FROM experiences WHERE embedding_json IS NULL AND text IS NOT NULL AND length(text) > 10 ORDER BY id ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def list_unprocessed_experiences(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._conn() as c:
@@ -773,6 +802,38 @@ class Store:
                 (int(since_id), int(limit)),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def list_triples_with_embeddings(self, limit: int = 500) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, subject, predicate, object, confidence, embedding_json
+                FROM triples
+                WHERE embedding_json IS NOT NULL
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_triples_without_embeddings(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, subject, predicate, object
+                FROM triples
+                WHERE embedding_json IS NULL
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_triple_embedding(self, tid: int, embedding_json: str):
+        with self._conn() as c:
+            c.execute("UPDATE triples SET embedding_json=? WHERE id=?", (embedding_json, int(tid)))
 
     def list_norms(self, limit: int = 200) -> list[dict[str, Any]]:
         """Return compiled norms for gating (subject='AGI')."""
