@@ -364,6 +364,36 @@ class Store:
             )
             self._recompute_source_trust(c, source_id)
 
+    def list_sources(self, limit: int = 100, order_by: str = "trust") -> list[dict[str, Any]]:
+        """Lista todas as fontes com suas estatísticas de confiança."""
+        order = "trust DESC" if order_by == "trust" else "updated_at DESC"
+        with self._conn() as c:
+            rows = c.execute(
+                f"""
+                SELECT id, created_at, updated_at, kind, label, trust, 
+                       support_count, contradict_count, notes
+                FROM sources
+                ORDER BY {order}, id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_source(self, source_id: str) -> dict[str, Any] | None:
+        """Busca uma fonte específica."""
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT id, created_at, updated_at, kind, label, trust, 
+                       support_count, contradict_count, notes
+                FROM sources
+                WHERE id=?
+                """,
+                (source_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def add_experience(
         self,
         user_id: str | None,
@@ -636,10 +666,37 @@ class Store:
             ).fetchall()
         return [r[0] for r in rows]
 
+    def get_question(self, qid: int) -> dict[str, Any] | None:
+        """Busca uma pergunta por ID com todos os campos."""
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT id, question, context, priority, created_at, status, 
+                       answered_at, answer, template_id, concept
+                FROM questions
+                WHERE id=?
+                """,
+                (int(qid),),
+            ).fetchone()
+        return dict(row) if row else None
+
     def add_questions(self, qs: list[dict[str, Any]]):
         if not qs:
             return
         with self._conn() as c:
+            # Migrate: add template_id and concept columns if missing
+            cols = {r[1] for r in c.execute("PRAGMA table_info(questions)").fetchall()}
+            if "template_id" not in cols:
+                try:
+                    c.execute("ALTER TABLE questions ADD COLUMN template_id TEXT")
+                except Exception:
+                    pass
+            if "concept" not in cols:
+                try:
+                    c.execute("ALTER TABLE questions ADD COLUMN concept TEXT")
+                except Exception:
+                    pass
+            
             existing = set(
                 r[0]
                 for r in c.execute("SELECT question FROM questions WHERE status='open'").fetchall()
@@ -651,8 +708,16 @@ class Store:
                 if qt.startswith("```") or "\"question\"" in qt:
                     continue
                 c.execute(
-                    "INSERT INTO questions(created_at,status,question,context,priority) VALUES(?,?,?,?,?)",
-                    (_ts(), "open", qt, q.get("context"), int(q.get("priority") or 0)),
+                    "INSERT INTO questions(created_at,status,question,context,priority,template_id,concept) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        _ts(),
+                        "open",
+                        qt,
+                        q.get("context"),
+                        int(q.get("priority") or 0),
+                        q.get("template_id"),
+                        q.get("concept"),
+                    ),
                 )
                 existing.add(qt)
 

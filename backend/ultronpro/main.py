@@ -272,6 +272,27 @@ async def refresh():
     return {"success": True, "proposed": proposed, "next": store.next_question()}
 
 
+@app.get("/api/curiosity/stats")
+async def curiosity_stats():
+    """Estatísticas do sistema de curiosidade adaptativa."""
+    return {"success": True, "stats": curiosity.get_stats()}
+
+
+@app.get("/api/sources")
+async def list_sources(limit: int = 100, order_by: str = "trust"):
+    """Lista todas as fontes com suas estatísticas de confiança."""
+    return {"success": True, "sources": store.list_sources(limit=limit, order_by=order_by)}
+
+
+@app.get("/api/sources/{source_id}")
+async def get_source(source_id: str):
+    """Busca detalhes de uma fonte específica."""
+    s = store.get_source(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+    return {"success": True, "source": s}
+
+
 @app.get("/api/next")
 async def next_q():
     q = store.next_question()
@@ -282,12 +303,26 @@ async def next_q():
 
 @app.post("/api/answer")
 async def answer(req: Answer):
+    # Busca a pergunta para extrair metadata
+    q_meta = store.get_question(req.question_id)
+    
     store.answer_question(req.question_id, req.answer)
 
     # Assimilação mínima: extrair triplas do texto (heurístico) e registrar como conhecimento.
     triples = extract_triples(req.answer)
     for (s, p, o, conf) in triples[:10]:
         store.add_or_reinforce_triple(s, p, o, confidence=conf, note=f"from_answer:q={req.question_id}")
+
+    # Feedback para o sistema de curiosidade adaptativa
+    if q_meta:
+        template_id = q_meta.get("template_id")
+        concept = q_meta.get("concept")
+        curiosity.record_answer_feedback(
+            template_id=template_id,
+            concept=concept,
+            answer_length=len(req.answer),
+            triples_extracted=len(triples),
+        )
 
     return {"success": True, "triples_added": len(triples)}
 
