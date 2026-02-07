@@ -18,6 +18,7 @@ from ultronpro.federated import export_bundle, import_bundle
 from ultronpro.signing import sign_bundle, verify_bundle
 from ultronpro.policy import evaluate_action
 from ultronpro.planner import propose_actions
+from ultronpro.conflict_resolver import ConflictResolver
 from ultronpro import autofeeder
 from ultronpro import embeddings as emb
 import json
@@ -25,6 +26,7 @@ import json
 
 store = Store("/app/data/ultronpro.sqlite")
 curiosity = CuriosityProcessor()
+conflict_resolver = ConflictResolver(store)
 
 # Lazy flag to avoid loading model on every loop iteration
 _embeddings_ready = False
@@ -104,6 +106,12 @@ async def _autonomous_loop():
                         cooldown_hours=12.0,
                     ):
                         store.add_synthesis_question_if_needed(c, conflict_id=cid)
+
+            # 3.5) Auto-resolve conflicts via LLM
+            try:
+                conflict_resolver.resolve_pending(max_conflicts=2)
+            except Exception:
+                pass
 
             # 4) Auto-feeder: ingest knowledge from public sources automatically
             try:
@@ -468,6 +476,21 @@ async def policy_check(req: PolicyCheckReq):
 @app.get("/api/conflicts")
 async def list_conflicts(status: str = 'open', limit: int = 50):
     return {"success": True, "conflicts": store.list_conflicts(status=status, limit=limit)}
+
+
+@app.post("/api/conflicts/auto-resolve")
+async def trigger_auto_resolve(max_conflicts: int = 3):
+    """Dispara resolução automática de conflitos via LLM."""
+    try:
+        results = conflict_resolver.resolve_pending(max_conflicts=max_conflicts)
+        return {
+            "success": True,
+            "results": results,
+            "resolved": sum(1 for r in results if r.get("resolved")),
+            "needs_human": sum(1 for r in results if r.get("needs_human")),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/conflicts/cleanup_norms")

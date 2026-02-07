@@ -621,12 +621,17 @@
       <div class="card">
         <div class="card-header">
           <div class="card-title"><span class="icon">⚡</span> Conflitos Abertos</div>
-          <button class="btn btn-sm btn-secondary" onclick="loadConflicts()">🔄 Refresh</button>
+          <div class="btn-group">
+            <button class="btn btn-sm" onclick="autoResolveConflicts()">🤖 Auto-resolver</button>
+            <button class="btn btn-sm btn-secondary" onclick="loadConflicts()">🔄 Refresh</button>
+          </div>
         </div>
         <div class="card-body">
           <div class="muted" style="margin-bottom: 16px">
-            Resolva conflitos escolhendo a variante correta. Isso ajusta a confiança das fontes e consolida o conhecimento.
+            <strong>🤖 Auto-resolver:</strong> A LLM analisa as evidências e decide automaticamente.<br>
+            <strong>👤 Manual:</strong> Escolha a variante correta abaixo. Isso ajusta a confiança das fontes.
           </div>
+          <div id="autoResolveStatus" style="display: none; margin-bottom: 16px; padding: 12px; background: var(--bg-secondary); border-radius: 8px;"></div>
           <div id="conflictsList"></div>
           <div id="conflictsMsg" class="muted" style="margin-top: 12px"></div>
         </div>
@@ -1019,6 +1024,44 @@
         }).join('');
       } catch (e) {
         showToast('❌ ' + e.message, 'error');
+      }
+    }
+
+    async function autoResolveConflicts() {
+      const btn = document.querySelector('button[onclick="autoResolveConflicts()"]');
+      const statusDiv = document.getElementById('autoResolveStatus');
+      
+      try {
+        btn.disabled = true;
+        btn.textContent = '⏳ Resolvendo...';
+        statusDiv.style.display = 'block';
+        statusDiv.innerHTML = '<span class="muted">Analisando conflitos com LLM... isso pode levar alguns segundos.</span>';
+        
+        const r = await api('/api/conflicts/auto-resolve', { method: 'POST' });
+        
+        let html = `<div><strong>Resultado:</strong> ${r.resolved} resolvidos, ${r.needs_human} precisam de humano.</div>`;
+        if (r.results && r.results.length) {
+          html += '<ul style="margin-top:8px;padding-left:20px;font-size:13px">';
+          r.results.forEach(res => {
+            const icon = res.resolved ? '✅' : (res.needs_human ? '👤' : '⚠️');
+            html += `<li>${icon} <strong>${escHtml(res.subject)}</strong>: ${escHtml(res.reasoning)}</li>`;
+          });
+          html += '</ul>';
+        } else {
+          html += '<div class="muted" style="margin-top:4px">Nenhum conflito elegível para auto-resolução no momento (cooldown ou insuficientes).</div>';
+        }
+        
+        statusDiv.innerHTML = html;
+        showToast('Processo finalizado');
+        await loadConflicts();
+        await loadStatus();
+        
+      } catch (e) {
+        statusDiv.innerHTML = `<span style="color:var(--accent-red)">Erro: ${escHtml(e.message)}</span>`;
+        showToast('Erro na auto-resolução', 'error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '🤖 Auto-resolver';
       }
     }
 
