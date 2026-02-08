@@ -90,8 +90,8 @@ async def ingest(req: IngestRequest):
         if graph.add_triple(t, source_id=f"exp_{exp_id}"):
             added += 1
             
-    # 4. Push to LightRAG (Async background usually, but here await)
-    await ingest_knowledge(req.text, source=req.source_id or "user")
+    # 4. Push to LightRAG (Disabled by user request - knowledge flows FROM LightRAG only)
+    # await ingest_knowledge(req.text, source=req.source_id or "user")
 
     return {"status": "ok", "experience_id": exp_id, "triples_extracted": len(triples), "triples_added": added}
 
