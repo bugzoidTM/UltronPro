@@ -67,15 +67,40 @@ async def autofeeder_loop():
     
     while True:
         try:
+            # Try external sources first (Wikipedia, Quotes, Facts)
             result = autofeeder.fetch_next()
             if result:
-                # Ingest the fetched content (sem LLM, só armazena)
+                # Ingest the fetched content
                 exp_id = store.add_experience(
                     text=result.text,
                     source_id=result.source_id,
                     modality=result.modality
                 )
+                # Create learning event
+                store.db.add_event(
+                    kind="autofeeder_ingest",
+                    text=f"📚 Aprendido de {result.source_id}: {result.title or result.text[:80]}"
+                )
                 logger.info(f"Autofeeder: Ingested from {result.source_id} (exp_id={exp_id})")
+            
+            # Also try fetching from LightRAG periodically
+            try:
+                from ultronpro.knowledge_bridge import fetch_random_documents
+                lightrag_docs = await fetch_random_documents(limit=1)
+                for doc in lightrag_docs:
+                    exp_id = store.add_experience(
+                        text=doc["content"],
+                        source_id=f"lightrag:{doc['id'][:8]}",
+                        modality="lightrag_document"
+                    )
+                    store.db.add_event(
+                        kind="lightrag_sync",
+                        text=f"🔗 Sincronizado do LightRAG: {doc['summary'][:80]}"
+                    )
+                    logger.info(f"Autofeeder: Synced from LightRAG doc {doc['id'][:8]} (exp_id={exp_id})")
+            except Exception as e:
+                logger.debug(f"LightRAG fetch skipped: {e}")
+                
         except Exception as e:
             logger.error(f"Autofeeder error: {e}")
         
