@@ -1,8 +1,19 @@
 import os
 import logging
-from openai import OpenAI
-from groq import Groq
-from anthropic import Anthropic
+from typing import Dict, Optional, Any
+from ultronpro.settings import get_api_key
+
+# --- API Models ---
+from pydantic import BaseModel
+
+class SettingsUpdate(BaseModel):
+    openai_api_key: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
+    groq_api_key: Optional[str] = None
+    deepseek_api_key: Optional[str] = None
+    lightrag_api_key: Optional[str] = None
+
+logger = logging.getLogger("uvicorn")
 
 # LLM Routing Strategy
 MODELS = {
@@ -13,34 +24,38 @@ MODELS = {
     "deep": {"provider": "deepseek", "model": "deepseek-reasoner"}
 }
 
-logger = logging.getLogger("uvicorn")
-
 class LLMRouter:
     def __init__(self):
+        # Clients cache
         self.clients = {}
 
-    def _get_client(self, provider: str):
+    def _get_client(self, provider: str) -> Any:
         if provider in self.clients:
             return self.clients[provider]
         
-        # Lazy init logic with environment keys
+        client = None
         try:
+            key = get_api_key(provider)
+            
             if provider == "openai":
-                key = os.getenv("OPENAI_API_KEY")
-                if key: self.clients[provider] = OpenAI(api_key=key)
+                from openai import OpenAI
+                if key: client = OpenAI(api_key=key)
             elif provider == "anthropic":
-                key = os.getenv("ANTHROPIC_API_KEY")
-                if key: self.clients[provider] = Anthropic(api_key=key)
+                from anthropic import Anthropic
+                if key: client = Anthropic(api_key=key)
             elif provider == "groq":
-                key = os.getenv("GROQ_API_KEY")
-                if key: self.clients[provider] = Groq(api_key=key)
+                from groq import Groq
+                if key: client = Groq(api_key=key)
             elif provider == "deepseek":
-                key = os.getenv("DEEPSEEK_API_KEY")
-                if key: self.clients[provider] = OpenAI(api_key=key, base_url="https://api.deepseek.com")
+                from openai import OpenAI
+                if key: client = OpenAI(api_key=key, base_url="https://api.deepseek.com")
         except Exception as e:
             logger.error(f"Failed to init {provider}: {e}")
 
-        return self.clients.get(provider)
+        if client:
+            self.clients[provider] = client
+            
+        return client
 
     def complete(self, prompt: str, strategy: str = "default", system: str = None, json_mode: bool = False) -> str:
         config = MODELS.get(strategy, MODELS["default"])
@@ -59,7 +74,7 @@ class LLMRouter:
                 client = self._get_client("openai")
 
         if not client:
-            logger.error("No LLM clients available. Set API keys.")
+            logger.error("No LLM clients available. Please configure API Keys in Settings.")
             return ""
 
         try:
