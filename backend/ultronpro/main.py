@@ -153,7 +153,14 @@ async def ingest(req: IngestRequest):
     # 3. Update Graph & Detect Conflicts
     added = 0
     for t in triples:
-        if graph.add_triple(t, source_id=f"exp_{exp_id}"):
+        # Convert tuple (s, p, o, conf) to dict
+        triple_dict = {
+            "subject": t[0],
+            "predicate": t[1],
+            "object": t[2],
+            "confidence": t[3] if len(t) > 3 else 0.85
+        }
+        if graph.add_triple(triple_dict, source_id=f"exp_{exp_id}"):
             added += 1
             
     # 4. Push to LightRAG (Disabled by user request - knowledge flows FROM LightRAG only)
