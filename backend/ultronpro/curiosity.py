@@ -378,3 +378,36 @@ class CuriosityProcessor:
             "top_gaps": self._find_knowledge_gaps([])[:5],
             "templates": templates_stats,
         }
+
+
+# Global instance
+_processor = None
+
+def get_processor():
+    global _processor
+    if _processor is None:
+        _processor = CuriosityProcessor()
+    return _processor
+
+def get_next_question():
+    """Retorna próxima pergunta gerada pelo sistema de curiosidade."""
+    return get_processor().generate_question([])
+
+def mark_question_success(question_id: int, triples_count: int):
+    """Marca pergunta como bem sucedida."""
+    proc = get_processor()
+    # Encontra template_id da pergunta
+    # (isso requer que o store salve o template_id, mas por ora ignora)
+    pass
+
+def mark_question_failure(question_id: int):
+    """Marca pergunta como falha."""
+    pass
+
+def refresh_questions():
+    """Força geração de novas perguntas."""
+    return get_processor().generate_question([])
+
+def get_stats():
+    """Retorna estatísticas do sistema."""
+    return get_processor().get_stats()
