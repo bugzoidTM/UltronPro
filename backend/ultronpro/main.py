@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+import asyncio
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
@@ -8,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-from ultronpro import llm, knowledge_bridge, graph, settings, curiosity, conflicts, store, extract, planner
+from ultronpro import llm, knowledge_bridge, graph, settings, curiosity, conflicts, store, extract, planner, autofeeder
 from ultronpro.knowledge_bridge import search_knowledge, ingest_knowledge
 
 # Logging
@@ -57,14 +58,54 @@ class SettingsModel(BaseModel):
     lightrag_url: Optional[str] = None
 
 # --- Startup ---
+_autofeeder_task = None
+
+async def autofeeder_loop():
+    """Background task que busca conhecimento de fontes públicas."""
+    logger.info("Autofeeder started")
+    await asyncio.sleep(30)  # Wait 30s before first fetch
+    
+    while True:
+        try:
+            result = autofeeder.fetch_next()
+            if result:
+                # Ingest the fetched content (sem LLM, só armazena)
+                exp_id = store.add_experience(
+                    text=result.text,
+                    source_id=result.source_id,
+                    modality=result.modality
+                )
+                logger.info(f"Autofeeder: Ingested from {result.source_id} (exp_id={exp_id})")
+        except Exception as e:
+            logger.error(f"Autofeeder error: {e}")
+        
+        # Wait 60 seconds before next attempt (cooldowns are handled internally)
+        await asyncio.sleep(60)
+
 @app.on_event("startup")
 async def startup_event():
+    global _autofeeder_task
     logger.info("Starting UltronPRO...")
     store.init_db()
     graph.init()
     # Ensure settings are loaded/initialized
     s = settings.load_settings()
     logger.info(f"Loaded settings. LightRAG URL: {s.get('lightrag_url')}")
+    
+    # Start background autofeeder
+    _autofeeder_task = asyncio.create_task(autofeeder_loop())
+    logger.info("Autofeeder task created")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global _autofeeder_task
+    if _autofeeder_task:
+        _autofeeder_task.cancel()
+        try:
+            await _autofeeder_task
+        except asyncio.CancelledError:
+            pass
+    logger.info("Shutdown complete")
 
 # --- API Endpoints ---
 
