@@ -42,12 +42,6 @@ def extract_triples(text: str) -> list[tuple[str, str, str, float]]:
         logger.debug(f"extract_triples: text too short ({len(text) if text else 0} chars)")
         return []
 
-    # Optimization: if text is very short, use regex to save GPU
-    if len(text) < 50:
-        logger.debug(f"extract_triples: skipping short text ({len(text)} chars)")
-        # minimal regex logic
-        return []
-
     prompt = f"""Extract key facts from the text as triples (Subject, Predicate, Object).
 Focus on relationships, definitions, and causality.
 Return ONLY a JSON array of objects with keys "s", "p", "o".
@@ -60,7 +54,7 @@ Text: {text[:3000]}"""
     
     out = []
     try:
-        data = json.loads(res)
+        data = json.loads(res) if res else None
         logger.debug(f"extract_triples: parsed JSON type={type(data)}")
         
         if isinstance(data, dict):
