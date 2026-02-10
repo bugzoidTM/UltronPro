@@ -94,14 +94,16 @@ class Store:
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   created_at REAL NOT NULL,
                   updated_at REAL,
-                  status TEXT NOT NULL, -- queued|running|done|blocked|error
+                  status TEXT NOT NULL, -- queued|running|done|blocked|error|expired
                   kind TEXT NOT NULL,
                   text TEXT NOT NULL,
                   priority INTEGER NOT NULL DEFAULT 0,
                   policy_allowed INTEGER,
                   policy_score REAL,
                   last_error TEXT,
-                  meta_json TEXT
+                  meta_json TEXT,
+                  expires_at REAL,
+                  cooldown_key TEXT
                 )
                 """
             )
@@ -246,8 +248,23 @@ class Store:
                 ("blob_path", "ALTER TABLE experiences ADD COLUMN blob_path TEXT"),
                 ("mime", "ALTER TABLE experiences ADD COLUMN mime TEXT"),
                 ("embedding_json", "ALTER TABLE experiences ADD COLUMN embedding_json TEXT"),
+                ("curated_at", "ALTER TABLE experiences ADD COLUMN curated_at REAL"),
+                ("archived_at", "ALTER TABLE experiences ADD COLUMN archived_at REAL"),
+                ("utility_score", "ALTER TABLE experiences ADD COLUMN utility_score REAL"),
             ]:
                 if col not in exp_cols:
+                    try:
+                        c.execute(ddl)
+                    except Exception:
+                        pass
+
+            # migrations for actions
+            act_cols = {r[1] for r in c.execute("PRAGMA table_info(actions)").fetchall()}
+            for col, ddl in [
+                ("expires_at", "ALTER TABLE actions ADD COLUMN expires_at REAL"),
+                ("cooldown_key", "ALTER TABLE actions ADD COLUMN cooldown_key TEXT"),
+            ]:
+                if col not in act_cols:
                     try:
                         c.execute(ddl)
                     except Exception:
@@ -405,11 +422,38 @@ class Store:
         embedding_json: str | None = None,
     ) -> int:
         with self._conn() as c:
+            if source_id:
+                kind = "lightrag" if str(source_id).startswith("lightrag:") else "feed"
+                self._ensure_source_conn(c, str(source_id), kind=kind, label=str(source_id))
             cur = c.execute(
                 "INSERT INTO experiences(created_at, processed_at, user_id, source_id, modality, text, blob_path, mime, embedding_json) VALUES(?,?,?,?,?,?,?,?,?)",
                 (_ts(), None, user_id, source_id, modality, text, blob_path, mime, embedding_json),
             )
             return int(cur.lastrowid)
+
+    def rebuild_sources_from_experiences(self, limit: int = 5000) -> int:
+        """Backfill de fontes a partir das experiências antigas."""
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT DISTINCT source_id
+                FROM experiences
+                WHERE source_id IS NOT NULL AND trim(source_id) <> ''
+                ORDER BY source_id
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+            added = 0
+            for r in rows:
+                sid = str(r[0])
+                ex = c.execute("SELECT id FROM sources WHERE id=?", (sid,)).fetchone()
+                if ex:
+                    continue
+                kind = "lightrag" if sid.startswith("lightrag:") else "feed"
+                self._ensure_source_conn(c, sid, kind=kind, label=sid)
+                added += 1
+            return added
 
     def update_experience_embedding(self, eid: int, embedding_json: str):
         with self._conn() as c:
@@ -418,10 +462,107 @@ class Store:
     def list_experiences(self, limit: int = 30) -> list[dict[str, Any]]:
         with self._conn() as c:
             rows = c.execute(
-                "SELECT id, created_at, processed_at, user_id, source_id, modality, text, blob_path, mime, embedding_json FROM experiences ORDER BY id DESC LIMIT ?",
+                "SELECT id, created_at, processed_at, curated_at, user_id, source_id, modality, text, blob_path, mime, embedding_json FROM experiences ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows][::-1]
+
+    def count_uncurated_experiences(self) -> int:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) FROM experiences WHERE archived_at IS NULL AND curated_at IS NULL AND text IS NOT NULL AND length(text) > 40"
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def list_uncurated_experiences(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, created_at, source_id, modality, text
+                FROM experiences
+                WHERE archived_at IS NULL
+                  AND curated_at IS NULL
+                  AND text IS NOT NULL
+                  AND length(text) > 40
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_archived_experiences(self) -> int:
+        with self._conn() as c:
+            row = c.execute("SELECT COUNT(*) FROM experiences WHERE archived_at IS NOT NULL").fetchone()
+        return int(row[0] or 0)
+
+    def count_distilled_experiences(self) -> int:
+        with self._conn() as c:
+            row = c.execute("SELECT COUNT(*) FROM experiences WHERE modality='distilled'").fetchone()
+        return int(row[0] or 0)
+
+    def mark_experiences_curated(self, ids: list[int]):
+        if not ids:
+            return
+        now = _ts()
+        with self._conn() as c:
+            for eid in ids:
+                c.execute("UPDATE experiences SET curated_at=? WHERE id=?", (now, int(eid)))
+
+    def prune_low_utility_experiences(self, limit: int = 200, focus_terms: list[str] | None = None) -> int:
+        """Arquiva ruído textual antigo e curto para reduzir carga cognitiva.
+
+        Se focus_terms vier, aumenta utilidade de itens relacionados ao objetivo ativo.
+        """
+        now = _ts()
+        terms = [t.lower().strip() for t in (focus_terms or []) if t and len(t.strip()) >= 3][:12]
+
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, text, source_id, modality
+                FROM experiences
+                WHERE archived_at IS NULL
+                  AND text IS NOT NULL
+                  AND modality IN ('text','answer','file')
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+
+            pruned = 0
+            for r in rows:
+                eid = int(r[0])
+                txt = (r[1] or '').strip()
+                sid = (r[2] or '')
+                mod = (r[3] or 'text')
+                txtl = txt.lower()
+
+                # heurística simples de utilidade
+                utility = 0.5
+                if len(txt) < 80:
+                    utility -= 0.25
+                if sid.startswith('uselessfacts') or sid.startswith('quotable'):
+                    utility -= 0.25
+                if mod == 'answer' and len(txt) < 40:
+                    utility -= 0.2
+
+                # bônus se relacionado ao objetivo ativo
+                if terms and any(t in txtl for t in terms):
+                    utility += 0.25
+
+                utility = max(0.0, min(1.0, utility))
+                if utility <= 0.25:
+                    c.execute(
+                        "UPDATE experiences SET archived_at=?, utility_score=? WHERE id=?",
+                        (now, utility, eid),
+                    )
+                    pruned += 1
+                else:
+                    c.execute("UPDATE experiences SET utility_score=COALESCE(utility_score, ?) WHERE id=?", (utility, eid))
+
+            return pruned
 
     def list_experiences_with_embeddings(self, limit: int = 500) -> list[dict[str, Any]]:
         with self._conn() as c:
@@ -603,25 +744,36 @@ class Store:
         return [dict(r) for r in rows]
 
     # --- actions
-    def enqueue_action(self, kind: str, text: str, priority: int = 0, meta_json: str | None = None) -> int:
+    def enqueue_action(
+        self,
+        kind: str,
+        text: str,
+        priority: int = 0,
+        meta_json: str | None = None,
+        expires_at: float | None = None,
+        cooldown_key: str | None = None,
+    ) -> int:
         now = _ts()
         with self._conn() as c:
             cur = c.execute(
-                "INSERT INTO actions(created_at,updated_at,status,kind,text,priority,meta_json) VALUES(?,?,?,?,?,?,?)",
-                (now, now, 'queued', kind, text, int(priority or 0), meta_json),
+                "INSERT INTO actions(created_at,updated_at,status,kind,text,priority,meta_json,expires_at,cooldown_key) VALUES(?,?,?,?,?,?,?,?,?)",
+                (now, now, 'queued', kind, text, int(priority or 0), meta_json, expires_at, cooldown_key),
             )
             return int(cur.lastrowid)
 
     def next_action(self) -> dict[str, Any] | None:
+        now = _ts()
         with self._conn() as c:
             row = c.execute(
                 """
-                SELECT id, created_at, updated_at, status, kind, text, priority, policy_allowed, policy_score, last_error, meta_json
+                SELECT id, created_at, updated_at, status, kind, text, priority, policy_allowed, policy_score, last_error, meta_json, expires_at, cooldown_key
                 FROM actions
                 WHERE status='queued'
+                  AND (expires_at IS NULL OR expires_at > ?)
                 ORDER BY priority DESC, id ASC
                 LIMIT 1
                 """,
+                (now,),
             ).fetchone()
         return dict(row) if row else None
 
@@ -648,7 +800,7 @@ class Store:
         with self._conn() as c:
             rows = c.execute(
                 """
-                SELECT id, created_at, updated_at, status, kind, text, priority, policy_allowed, policy_score, last_error
+                SELECT id, created_at, updated_at, status, kind, text, priority, policy_allowed, policy_score, last_error, expires_at, cooldown_key
                 FROM actions
                 ORDER BY id DESC
                 LIMIT ?
@@ -656,6 +808,105 @@ class Store:
                 (int(limit),),
             ).fetchall()
         return [dict(r) for r in rows][::-1]
+
+    def expire_queued_actions(self) -> int:
+        now = _ts()
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE actions SET status='expired', updated_at=? WHERE status='queued' AND expires_at IS NOT NULL AND expires_at<=?",
+                (now, now),
+            )
+            return int(cur.rowcount or 0)
+
+    # --- goals
+    def upsert_goal(self, title: str, description: str | None = None, priority: int = 0) -> int:
+        t = (title or "").strip()
+        if not t:
+            raise ValueError("empty goal title")
+
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT id FROM goals
+                WHERE title=? AND status IN ('open','active')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (t,),
+            ).fetchone()
+            if row:
+                gid = int(row[0])
+                c.execute(
+                    "UPDATE goals SET description=COALESCE(?, description), priority=MAX(priority, ?) WHERE id=?",
+                    (description, int(priority or 0), gid),
+                )
+                return gid
+
+            cur = c.execute(
+                "INSERT INTO goals(created_at,status,title,description,priority) VALUES(?,?,?,?,?)",
+                (_ts(), "open", t, description, int(priority or 0)),
+            )
+            return int(cur.lastrowid)
+
+    def list_goals(self, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            if status:
+                rows = c.execute(
+                    "SELECT id, created_at, status, title, description, priority FROM goals WHERE status=? ORDER BY priority DESC, id DESC LIMIT ?",
+                    (status, int(limit)),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT id, created_at, status, title, description, priority FROM goals ORDER BY id DESC LIMIT ?",
+                    (int(limit),),
+                ).fetchall()
+        return [dict(r) for r in rows][::-1]
+
+    def get_active_goal(self) -> dict[str, Any] | None:
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT id, created_at, status, title, description, priority
+                FROM goals
+                WHERE status='active'
+                ORDER BY priority DESC, id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row else None
+
+    def activate_goal(self, goal_id: int) -> bool:
+        gid = int(goal_id)
+        with self._conn() as c:
+            row = c.execute("SELECT id FROM goals WHERE id=? AND status IN ('open','active')", (gid,)).fetchone()
+            if not row:
+                return False
+            c.execute("UPDATE goals SET status='open' WHERE status='active' AND id<>?", (gid,))
+            c.execute("UPDATE goals SET status='active' WHERE id=?", (gid,))
+        return True
+
+    def activate_next_goal(self) -> dict[str, Any] | None:
+        active = self.get_active_goal()
+        if active:
+            return active
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT id, created_at, status, title, description, priority
+                FROM goals
+                WHERE status='open'
+                ORDER BY priority DESC, id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+        if not row:
+            return None
+        gid = int(row[0])
+        self.activate_goal(gid)
+        return self.get_active_goal()
+
+    def mark_goal_done(self, goal_id: int):
+        with self._conn() as c:
+            c.execute("UPDATE goals SET status='done' WHERE id=?", (int(goal_id),))
 
     # --- questions
     def list_open_questions(self, limit: int = 50) -> list[str]:
@@ -1140,7 +1391,7 @@ class Store:
 
             rows = c.execute(
                 f"""
-                SELECT id, created_at, updated_at, status, subject, predicate, first_seen_at, last_seen_at, seen_count, last_summary
+                SELECT id, created_at, updated_at, status, subject, predicate, first_seen_at, last_seen_at, seen_count, question_count, last_question_at, last_summary
                 FROM conflicts
                 WHERE {where}
                 ORDER BY last_seen_at DESC, id DESC
@@ -1149,6 +1400,40 @@ class Store:
                 (status, int(limit)),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def list_prioritized_conflicts(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Prioriza conflitos persistentes + impacto no grafo para ciclo tese↔antítese↔síntese."""
+        items = self.list_conflicts(status='open', limit=max(20, int(limit) * 3))
+        now = _ts()
+
+        scored = []
+        with self._conn() as c:
+            for cf in items:
+                age_h = max(0.0, (now - float(cf.get('first_seen_at') or now)) / 3600.0)
+                seen = int(cf.get('seen_count') or 0)
+                qcount = int(cf.get('question_count') or 0)
+                subj = cf.get('subject')
+                pred = cf.get('predicate')
+
+                # impacto: quantas triplas usam sujeito/predicado relacionado
+                impact_row = c.execute(
+                    "SELECT COUNT(*) FROM triples WHERE subject=? OR predicate=?",
+                    (subj, pred),
+                ).fetchone()
+                impact = int(impact_row[0] or 0) if impact_row else 0
+
+                # score crítico
+                score = (seen * 1.0) + (min(age_h, 96.0) / 10.0) + (qcount * 0.8) + (min(impact, 80) * 0.35)
+                risk = "high" if score >= 25 else ("medium" if score >= 12 else "low")
+
+                c2 = dict(cf)
+                c2['impact_score'] = impact
+                c2['criticality'] = risk
+                c2['priority_score'] = round(score, 3)
+                scored.append(c2)
+
+        scored.sort(key=lambda x: (x.get('priority_score', 0), x.get('impact_score', 0), x.get('id', 0)), reverse=True)
+        return scored[: int(limit)]
 
     def archive_norm_conflicts(self) -> int:
         """One-shot cleanup: archive conflicts created from norms (subject='AGI')."""
@@ -1177,8 +1462,29 @@ class Store:
                 """,
                 (int(cid),),
             ).fetchall()
+
+            out_vars = []
+            for v in variants:
+                vd = dict(v)
+                tid = vd.get("triple_id")
+                if tid:
+                    srow = c.execute(
+                        """
+                        SELECT AVG(COALESCE(s.trust,0.5))
+                        FROM triple_evidence te
+                        JOIN experiences e ON e.id=te.experience_id
+                        LEFT JOIN sources s ON s.id=e.source_id
+                        WHERE te.triple_id=?
+                        """,
+                        (int(tid),),
+                    ).fetchone()
+                    vd["source_trust"] = float(srow[0]) if srow and srow[0] is not None else 0.5
+                else:
+                    vd["source_trust"] = 0.5
+                out_vars.append(vd)
+
         out = dict(row)
-        out['variants'] = [dict(v) for v in variants]
+        out['variants'] = out_vars
         return out
 
     def resolve_conflict(
@@ -1396,6 +1702,27 @@ def add_experience(text: str, source_id: str = None, modality: str = "text", **k
 def get_question(qid: int):
     return db.get_question(qid)
 
+def count_uncurated_experiences():
+    return db.count_uncurated_experiences()
+
+def list_uncurated_experiences(limit: int = 50):
+    return db.list_uncurated_experiences(limit)
+
+def count_archived_experiences():
+    return db.count_archived_experiences()
+
+def count_distilled_experiences():
+    return db.count_distilled_experiences()
+
+def mark_experiences_curated(ids: list[int]):
+    return db.mark_experiences_curated(ids)
+
+def rebuild_sources_from_experiences(limit: int = 5000):
+    return db.rebuild_sources_from_experiences(limit)
+
+def prune_low_utility_experiences(limit: int = 200, focus_terms: list[str] | None = None):
+    return db.prune_low_utility_experiences(limit, focus_terms=focus_terms)
+
 def mark_question_answered(qid: int, answer: str):
     return db.answer_question(qid, answer)
 
@@ -1419,6 +1746,21 @@ def search_triples(query: str, limit: int = 10):
 
 def add_or_reinforce_triple(subject, predicate, object_, confidence=0.5, note=None, experience_id=None):
     return db.add_or_reinforce_triple(subject, predicate, object_, confidence, experience_id, note)
+
+def upsert_goal(title: str, description: str | None = None, priority: int = 0):
+    return db.upsert_goal(title, description, priority)
+
+def list_goals(status: str | None = None, limit: int = 50):
+    return db.list_goals(status=status, limit=limit)
+
+def get_active_goal():
+    return db.get_active_goal()
+
+def activate_next_goal():
+    return db.activate_next_goal()
+
+def mark_goal_done(goal_id: int):
+    return db.mark_goal_done(goal_id)
 
 # Backwards compatibility alias
 add_triple = add_or_reinforce_triple

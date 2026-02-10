@@ -33,8 +33,33 @@ Text: {text[:4000]}"""
         pass
     return out
 
+def _regex_fallback(text: str) -> list[tuple[str, str, str, float]]:
+    out: list[tuple[str, str, str, float]] = []
+    seen = set()
+
+    patterns = [
+        (re.compile(r"([A-ZÀ-ÿ][^\.\n]{2,80}?)\s+é\s+([^\.\n]{2,120})[\.;]", re.IGNORECASE), "é"),
+        (re.compile(r"([A-ZÀ-ÿ][^\.\n]{2,80}?)\s+tem\s+([^\.\n]{2,120})[\.;]", re.IGNORECASE), "tem"),
+        (re.compile(r"([A-ZÀ-ÿ][^\.\n]{2,80}?)\s+causa\s+([^\.\n]{2,120})[\.;]", re.IGNORECASE), "causa"),
+    ]
+
+    for pat, pred in patterns:
+        for m in pat.finditer(text):
+            s = re.sub(r"\s+", " ", (m.group(1) or "").strip())
+            o = re.sub(r"\s+", " ", (m.group(2) or "").strip())
+            key = (s.lower(), pred.lower(), o.lower())
+            if len(s) < 2 or len(o) < 2 or key in seen:
+                continue
+            seen.add(key)
+            out.append((s, pred, o, 0.55))
+            if len(out) >= 12:
+                return out
+
+    return out
+
+
 def extract_triples(text: str) -> list[tuple[str, str, str, float]]:
-    """Extract triples using LLM (Mistral)."""
+    """Extract triples using LLM; fallback para regex quando não houver LLM."""
     import logging
     logger = logging.getLogger("uvicorn")
     
@@ -74,5 +99,11 @@ Text: {text[:3000]}"""
     except Exception as e:
         logger.error(f"extract_triples: JSON parse failed: {e}")
     
+    if not out:
+        fb = _regex_fallback(text)
+        if fb:
+            logger.info(f"extract_triples: regex fallback generated {len(fb)} triples")
+            return fb
+
     logger.info(f"extract_triples: returning {len(out)} triples")
     return out

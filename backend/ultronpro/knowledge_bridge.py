@@ -12,80 +12,104 @@ def _get_lightrag_config():
     return s.get("lightrag_url"), s.get("lightrag_api_key")
 
 async def search_knowledge(query: str, top_k: int = 5) -> List[Dict]:
-    """Search LightRAG knowledge base."""
+    """Search LightRAG knowledge base via /query endpoint."""
     url, key = _get_lightrag_config()
     if not url or not key:
         logger.warning("LightRAG not configured. Skipping knowledge search.")
         return []
-        
+
+    base = url.rstrip("/")
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                f"{url}/search",
+                f"{base}/query",
                 headers={"X-API-Key": key},
-                json={"query": query, "limit": top_k},
-                timeout=10.0
+                json={
+                    "query": query,
+                    "mode": "mix",
+                    "top_k": int(top_k),
+                    "only_need_context": True,
+                },
+                timeout=20.0,
             )
             resp.raise_for_status()
             data = resp.json()
-            # Adapt LightRAG response format to UltronPro expectations
-            return [{"text": r.get("content"), "source_id": "lightrag", "score": r.get("score")} for r in data.get("results", [])]
-            
+
+            # LightRAG usually returns context blob; adapt into list for UI
+            context = data.get("context") or data.get("response") or ""
+            if not context:
+                return []
+
+            text = str(context)
+            return [{"text": text[:2500], "source_id": "lightrag", "score": 0.7, "type": "experience"}]
+
     except Exception as e:
         logger.error(f"LightRAG Search Error: {e}")
         return []
 
 async def fetch_random_documents(limit: int = 1) -> List[Dict]:
-    """Fetch random documents from LightRAG."""
+    """Fetch random documents from LightRAG.
+
+    Compatível com instâncias onde /documents/{id} não existe.
+    """
     url, key = _get_lightrag_config()
     if not url or not key:
         return []
-        
+
+    base = url.replace('/api', '')
+
     try:
         async with httpx.AsyncClient() as client:
-            # List all documents
             resp = await client.get(
-                f"{url.replace('/api', '')}/documents",
+                f"{base}/documents",
                 headers={"X-API-Key": key},
-                timeout=10.0
+                timeout=10.0,
             )
             resp.raise_for_status()
             data = resp.json()
-            
-            # Get processed documents
+
             processed = data.get("statuses", {}).get("processed", [])
             if not processed:
                 return []
-            
-            # Pick random ones
+
             import random
             selected = random.sample(processed, min(limit, len(processed)))
-            
+
             results = []
             for doc in selected:
-                # Fetch full document content
                 doc_id = doc.get("id")
-                if doc_id:
-                    try:
-                        doc_resp = await client.get(
-                            f"{url.replace('/api', '')}/documents/{doc_id}",
-                            headers={"X-API-Key": key},
-                            timeout=5.0
-                        )
-                        if doc_resp.status_code == 200:
-                            doc_data = doc_resp.json()
-                            content = doc_data.get("content", "")
-                            if len(content) > 100:  # Only if has substantial content
-                                results.append({
-                                    "id": doc_id,
-                                    "content": content[:2000],  # Limit to 2000 chars
-                                    "summary": doc.get("content_summary", "")[:200]
-                                })
-                    except Exception:
-                        pass
-            
+                if not doc_id:
+                    continue
+
+                # 1) Tenta endpoint de detalhe (se existir)
+                content = ""
+                try:
+                    doc_resp = await client.get(
+                        f"{base}/documents/{doc_id}",
+                        headers={"X-API-Key": key},
+                        timeout=5.0,
+                    )
+                    if doc_resp.status_code == 200:
+                        doc_data = doc_resp.json()
+                        content = (doc_data.get("content") or "").strip()
+                except Exception:
+                    pass
+
+                # 2) Fallback: usa summary do próprio listing
+                if not content:
+                    content = (doc.get("content_summary") or "").strip()
+
+                if len(content) > 40:
+                    results.append(
+                        {
+                            "id": doc_id,
+                            "content": content[:2000],
+                            "summary": (doc.get("content_summary") or content)[:200],
+                        }
+                    )
+
             return results
-            
+
     except Exception as e:
         logger.error(f"LightRAG Fetch Error: {e}")
         return []

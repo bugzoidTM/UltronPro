@@ -390,10 +390,9 @@ def get_processor():
     return _processor
 
 def get_next_question():
-    """Retorna próxima pergunta gerada pelo sistema de curiosidade."""
-    # Retorna None porque o sistema de perguntas de curiosidade não está sendo usado
-    # As perguntas são geradas pelo /api/curiosity/refresh
-    return None
+    """Retorna próxima pergunta aberta na fila."""
+    from ultronpro import store
+    return store.db.next_question()
 
 def mark_question_success(question_id: int, triples_count: int):
     """Marca pergunta como bem sucedida."""
@@ -410,11 +409,16 @@ def refresh_questions():
     """Força geração de novas perguntas."""
     from ultronpro import store
     # Gera perguntas baseadas em experiências recentes
-    recent_exp = store.db.list_experiences(limit=10)
-    questions = get_processor().propose(recent_exp)
+    recent_exp = store.db.list_experiences(limit=30)
+    open_q = store.db.list_open_questions(limit=200)
+    questions = get_processor().propose(recent_exp, open_q, target_count=5)
     if questions:
         store.db.add_questions(questions)
     return len(questions)
+
+def generate_questions():
+    """Alias de compatibilidade com main.py."""
+    return refresh_questions()
 
 def get_stats():
     """Retorna estatísticas do sistema."""

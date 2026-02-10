@@ -448,7 +448,7 @@
       <div class="logo-icon">U</div>
       <span class="logo-text">UltronPRO</span>
     </div>
-    <div class="phase-badge">🧒 Fase 1 — Bebê</div>
+    <div class="phase-badge" id="phaseBadge">🧒 Fase 1 — Bebê (AGI 0%)</div>
   </header>
 
   <!-- Tabs -->
@@ -474,6 +474,11 @@
         <div class="stat-card"><div class="stat-value" id="statOpen">-</div><div class="stat-label">Perguntas Abertas</div></div>
         <div class="stat-card"><div class="stat-value" id="statSources">-</div><div class="stat-label">Fontes</div></div>
         <div class="stat-card"><div class="stat-value green" id="statConflicts">-</div><div class="stat-label">Conflitos</div></div>
+      </div>
+      <div class="card" style="margin-bottom: 20px;">
+        <div class="card-body" style="padding: 12px 16px;">
+          <div class="muted" id="autonomyOps">Autonomia: carregando...</div>
+        </div>
       </div>
 
       <div class="grid-2">
@@ -747,10 +752,38 @@
     async function loadStatus() {
       try {
         const st = await api('/api/status');
+        const aut = await api('/api/autonomy/status');
+        const mem = await api('/api/memory/status');
+        const meta = await api('/api/metacognition/status');
+        const bench = await api('/api/agi/benchmark/trend?limit=7');
         document.getElementById('statExp').textContent = st.stats?.experiences || 0;
         document.getElementById('statTriples').textContent = st.stats?.triples || 0;
         document.getElementById('statAnswered').textContent = st.stats?.questions_answered || 0;
         document.getElementById('statOpen').textContent = st.stats?.questions_open || 0;
+
+        // AGI mode + fase dinâmica
+        const agiPct = Number(st.agi?.agi_mode_percent || 0);
+        let phase = '🧒 Fase 1 — Bebê';
+        if (agiPct >= 75) phase = '🧠 Fase 4 — Adulta';
+        else if (agiPct >= 55) phase = '🧑 Fase 3 — Adolescente';
+        else if (agiPct >= 35) phase = '🧒 Fase 2 — Criança';
+        const pb = document.getElementById('phaseBadge');
+        if (pb) pb.textContent = `${phase} (AGI ${agiPct.toFixed(1)}%)`;
+
+        const budget = aut?.budget || {};
+        const state = aut?.state || {};
+        const cbUntil = Number(state.circuit_open_until || 0);
+        const nowMono = Math.floor(Date.now()/1000);
+        const breaker = cbUntil > nowMono ? `ON (${cbUntil-nowMono}s)` : 'OFF';
+        const ao = document.getElementById('autonomyOps');
+        if (ao) {
+          const dq = Number(meta?.decision_quality || 0).toFixed(2);
+          const stuck = Number(meta?.stuck_cycles || 0);
+          const replans = Number(meta?.replans || 0);
+          const avgBench = Number(bench?.avg_score || 0).toFixed(1);
+          const hist = (bench?.history || []).map(h => Number(h.score||0).toFixed(0)).join(',');
+          ao.textContent = `Autonomia: budget ${budget.used_last_minute||0}/${budget.per_minute||'-'} por min • queued ${aut.queued||0} • expired ${aut.expired_recent||0} • circuit breaker ${breaker} • metacog q=${dq}, stuck=${stuck}, replans=${replans} • benchmark avg7=${avgBench}% [${hist}] • memória: uncurated ${mem.uncurated||0}, archived ${mem.archived||0}, distilled ${mem.distilled||0}`;
+        }
         
         currentQ = st.next;
         if (currentQ) {

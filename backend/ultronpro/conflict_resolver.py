@@ -45,7 +45,7 @@ def _build_analysis_prompt(conflict: dict, variants: list[dict], context: str = 
     predicate = conflict.get("predicate", "?")
     
     variants_text = "\n".join([
-        f"  - \"{v.get('object', '?')}\" (confiança: {v.get('confidence', 0):.2f}, visto {v.get('seen_count', 0)}x)"
+        f"  - \"{v.get('object', '?')}\" (confiança: {v.get('confidence', 0):.2f}, trust_fonte: {v.get('source_trust', 0.5):.2f}, visto {v.get('seen_count', 0)}x)"
         for v in variants
     ])
     
@@ -194,20 +194,37 @@ def analyze_conflict(
                 needs_human=True,
                 strategy="llm_synthesis_suggested",
             )
-        
+
         # Encontra o objeto exato (case-sensitive)
         exact_chosen = None
+        chosen_variant = None
         for v in variants:
             if v.get("object", "").strip().lower() == chosen.lower():
                 exact_chosen = v.get("object", "").strip()
+                chosen_variant = v
                 break
-        
+
+        # Ajuste por coerência global e trust de fonte
+        consistency = 0.5
+        if related_triples:
+            objl = (exact_chosen or "").lower()
+            hits = 0
+            for t in related_triples[:12]:
+                txt = f"{t.get('subject','')} {t.get('predicate','')} {t.get('object','')}".lower()
+                if objl and objl in txt:
+                    hits += 1
+            consistency = min(1.0, 0.4 + hits * 0.12)
+
+        source_trust = float((chosen_variant or {}).get("source_trust") or 0.5)
+        combined_conf = (0.55 * confidence) + (0.25 * source_trust) + (0.20 * consistency)
+
         return ResolutionResult(
-            resolved=True,
+            resolved=combined_conf >= AUTO_RESOLVE_THRESHOLD,
             chosen_object=exact_chosen,
-            confidence=confidence,
-            reasoning=reasoning,
-            strategy="llm_analysis",
+            confidence=combined_conf,
+            reasoning=f"{reasoning} | trust_fonte={source_trust:.2f} | coerência_global={consistency:.2f}",
+            strategy="llm_analysis_weighted",
+            needs_human=combined_conf < AUTO_RESOLVE_THRESHOLD,
         )
         
     except Exception as e:
