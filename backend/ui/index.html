@@ -460,6 +460,7 @@
     <button class="tab" data-tab="curiosity">🔮 Curiosidade</button>
     <button class="tab" data-tab="conflicts">⚡ Conflitos</button>
     <button class="tab" data-tab="search">🔍 Busca</button>
+    <button class="tab" data-tab="insights">💡 Insights</button>
     <button class="tab" data-tab="settings">⚙️ Config</button>
   </nav>
 
@@ -660,6 +661,23 @@
       </div>
     </div>
 
+    <!-- Insights Tab -->
+    <div id="tab-insights" class="tab-content">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">💡</span> Notificações & Insights da AGI</div>
+          <div class="btn-group">
+            <input type="search" id="insightSearch" placeholder="Buscar insights..." style="width:220px;">
+            <button class="btn btn-sm btn-secondary" onclick="loadInsights()">🔄 Refresh</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="muted" style="margin-bottom: 12px;">Canal de voz ativa do UltronPRO. Aqui ficam descobertas e atualizações feitas automaticamente.</div>
+          <div id="insightsList"></div>
+        </div>
+      </div>
+    </div>
+
     <!-- Settings Tab -->
     <div id="tab-settings" class="tab-content">
       <div class="card">
@@ -725,6 +743,7 @@
         if (tab.dataset.tab === 'sources') loadSources();
         if (tab.dataset.tab === 'curiosity') loadCuriosityStats();
         if (tab.dataset.tab === 'conflicts') loadConflicts();
+        if (tab.dataset.tab === 'insights') loadInsights();
         if (tab.dataset.tab === 'settings') loadSettings();
       });
     });
@@ -1235,6 +1254,36 @@
       return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
+    // === Insights ===
+    async function loadInsights() {
+      try {
+        const q = (document.getElementById('insightSearch')?.value || '').trim();
+        const url = q ? ('/api/insights?limit=80&query=' + encodeURIComponent(q)) : '/api/insights?limit=80';
+        const j = await api(url);
+        const items = j.insights || [];
+        const el = document.getElementById('insightsList');
+        if (!items.length) {
+          el.innerHTML = '<div class="muted">(nenhum insight ainda)</div>';
+          return;
+        }
+        el.innerHTML = items.map(i => {
+          const ts = new Date((i.created_at || 0) * 1000).toLocaleString();
+          return `
+            <div class="list-item">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+                <strong>${escHtml(i.title || 'Insight')}</strong>
+                <span class="tag tag-purple">${escHtml(i.kind || 'insight')}</span>
+              </div>
+              <div style="margin-top:6px;">${escHtml(i.text || '')}</div>
+              <div class="muted" style="margin-top:6px;">${ts}</div>
+            </div>
+          `;
+        }).join('');
+      } catch (e) {
+        showToast('❌ ' + e.message, 'error');
+      }
+    }
+
     // === Settings ===
     async function loadSettings() {
       try {
@@ -1292,6 +1341,9 @@
     // Enter key for search
     document.getElementById('searchInput').addEventListener('keypress', e => {
       if (e.key === 'Enter') doSearch();
+    });
+    document.getElementById('insightSearch').addEventListener('keypress', e => {
+      if (e.key === 'Enter') loadInsights();
     });
   </script>
 </body>

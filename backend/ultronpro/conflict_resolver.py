@@ -36,7 +36,8 @@ AUTO_RESOLVE_THRESHOLD = 0.7
 # Máximo de conflitos a resolver por ciclo
 MAX_CONFLICTS_PER_CYCLE = 3
 # Cooldown entre tentativas no mesmo conflito (horas)
-RETRY_COOLDOWN_HOURS = 24.0
+# reduzido para permitir auto-correção contínua sem esperar clique humano
+RETRY_COOLDOWN_HOURS = 1.0
 
 
 def _build_analysis_prompt(conflict: dict, variants: list[dict], context: str = "") -> str:

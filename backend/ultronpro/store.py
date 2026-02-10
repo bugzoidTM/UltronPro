@@ -87,6 +87,21 @@ class Store:
                 )
                 """
             )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS insights(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  created_at REAL NOT NULL,
+                  kind TEXT NOT NULL,
+                  priority INTEGER NOT NULL DEFAULT 3,
+                  title TEXT NOT NULL,
+                  text TEXT NOT NULL,
+                  conflict_id INTEGER,
+                  source_id TEXT,
+                  meta_json TEXT
+                )
+                """
+            )
             # migrations for events are unnecessary (new table)
             c.execute(
                 """
@@ -742,6 +757,58 @@ class Store:
                 (int(since_id), int(limit)),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # --- insights
+    def add_insight(
+        self,
+        kind: str,
+        title: str,
+        text: str,
+        priority: int = 3,
+        conflict_id: int | None = None,
+        source_id: str | None = None,
+        meta_json: str | None = None,
+    ) -> int:
+        now = _ts()
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO insights(created_at, kind, priority, title, text, conflict_id, source_id, meta_json) VALUES(?,?,?,?,?,?,?,?)",
+                (now, kind, int(priority), (title or "")[:180], (text or "")[:2500], conflict_id, source_id, meta_json),
+            )
+            # mirror in events so overview feed can show it immediately
+            c.execute(
+                "INSERT INTO events(created_at, kind, text, meta_json) VALUES(?,?,?,?)",
+                (now, "insight", f"💡 {title}: {(text or '')[:180]}", meta_json),
+            )
+            return int(cur.lastrowid)
+
+    def list_insights(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, created_at, kind, priority, title, text, conflict_id, source_id, meta_json
+                FROM insights
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows][::-1]
+
+    def search_insights(self, query: str, limit: int = 50) -> list[dict[str, Any]]:
+        like = f"%{(query or '').strip()}%"
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, created_at, kind, priority, title, text, conflict_id, source_id, meta_json
+                FROM insights
+                WHERE title LIKE ? OR text LIKE ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (like, like, int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows][::-1]
 
     # --- actions
     def enqueue_action(
@@ -1734,6 +1801,15 @@ def get_triples(since_id: int = 0, limit: int = 500):
 
 def get_events(since_id: int = 0, limit: int = 50):
     return db.list_events(since_id, limit)
+
+def add_insight(kind: str, title: str, text: str, priority: int = 3, conflict_id: int | None = None, source_id: str | None = None, meta_json: str | None = None):
+    return db.add_insight(kind, title, text, priority=priority, conflict_id=conflict_id, source_id=source_id, meta_json=meta_json)
+
+def list_insights(limit: int = 50):
+    return db.list_insights(limit)
+
+def search_insights(query: str, limit: int = 50):
+    return db.search_insights(query, limit)
 
 def get_sources(limit: int = 50):
     return db.list_sources(limit)

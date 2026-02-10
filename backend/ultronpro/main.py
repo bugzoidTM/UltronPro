@@ -67,6 +67,13 @@ class ActionPrepareRequest(BaseModel):
     payload: Optional[Dict[str, Any]] = None
     reason: str
 
+class PersistentGoalRequest(BaseModel):
+    title: str
+    description: Optional[str] = None
+    proactive_actions: Optional[List[str]] = None
+    interval_min: int = 60
+    active_hours: Optional[List[int]] = None  # [start_hour, end_hour]
+
 class ActionExecRequest(BaseModel):
     kind: str
     target: Optional[str] = None
@@ -78,6 +85,7 @@ class ActionExecRequest(BaseModel):
 # --- Startup ---
 _autofeeder_task = None
 _autonomy_task = None
+_judge_task = None
 _autonomy_state = {
     "ticks": 0,
     "last_tick": None,
@@ -108,6 +116,7 @@ ACTION_COOLDOWNS_SEC = {
 EXTERNAL_ACTION_ALLOWLIST = {"notify_human"}
 _external_confirm_tokens: dict[str, dict] = {}
 BENCHMARK_HISTORY_PATH = Path("/app/data/benchmark_history.json")
+PERSISTENT_GOALS_PATH = Path("/app/data/persistent_goals.json")
 
 
 def _benchmark_history_load() -> list[dict]:
@@ -130,6 +139,83 @@ def _benchmark_history_append(item: dict, max_items: int = 200):
         BENCHMARK_HISTORY_PATH.write_text(json.dumps(arr, ensure_ascii=False, indent=2))
     except Exception:
         pass
+
+
+def _persistent_goals_load() -> dict:
+    try:
+        if PERSISTENT_GOALS_PATH.exists():
+            d = json.loads(PERSISTENT_GOALS_PATH.read_text())
+            if isinstance(d, dict):
+                d.setdefault("goals", [])
+                d.setdefault("active_id", None)
+                return d
+    except Exception:
+        pass
+    return {"goals": [], "active_id": None}
+
+
+def _persistent_goals_save(data: dict):
+    try:
+        PERSISTENT_GOALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PERSISTENT_GOALS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+
+
+def _persistent_goal_active() -> dict | None:
+    d = _persistent_goals_load()
+    aid = d.get("active_id")
+    for g in d.get("goals", []):
+        if g.get("id") == aid:
+            return g
+    return None
+
+
+def _enqueue_from_persistent_goal():
+    g = _persistent_goal_active()
+    if not g:
+        return 0
+
+    now = time.time()
+    now_local_h = int(time.localtime(now).tm_hour)
+
+    # janela horária ativa
+    ah = g.get("active_hours") or [8, 23]
+    if isinstance(ah, list) and len(ah) == 2:
+        h0, h1 = int(ah[0]), int(ah[1])
+        if h0 <= h1:
+            if not (h0 <= now_local_h <= h1):
+                return 0
+        else:
+            # janela cruzando meia-noite
+            if not (now_local_h >= h0 or now_local_h <= h1):
+                return 0
+
+    # frequência
+    interval_min = max(5, int(g.get("interval_min") or 60))
+    last_run_at = float(g.get("last_run_at") or 0)
+    if (now - last_run_at) < (interval_min * 60):
+        return 0
+
+    actions = g.get("proactive_actions") or []
+    count = 0
+    for txt in actions[:4]:
+        t = (txt or "").strip()
+        if not t:
+            continue
+        _enqueue_action_if_new("ask_evidence", f"(ação-proativa-meta) {t}", priority=5, meta={"persistent_goal_id": g.get("id")})
+        count += 1
+
+    # persist last_run_at
+    if count > 0:
+        d = _persistent_goals_load()
+        for it in d.get("goals", []):
+            if it.get("id") == g.get("id"):
+                it["last_run_at"] = now
+                break
+        _persistent_goals_save(d)
+
+    return count
 
 
 def _latest_external_audit_hash() -> str | None:
@@ -209,6 +295,46 @@ def _refresh_goals_from_context() -> dict:
         created += 1
     active_goal = store.db.activate_next_goal()
     return {"proposed": len(proposed_goals), "upserts": created, "active": active_goal}
+
+
+async def _run_judge_cycle(limit: int = 2, source: str = "loop") -> dict:
+    """Integração real do Juiz: resolve conflitos em background sem clique humano."""
+    open_conf = len(store.db.list_conflicts(status="open", limit=200))
+    if open_conf <= 0:
+        return {"open_conflicts": 0, "resolved": 0, "needs_human": 0, "attempted": 0}
+
+    results = await conflicts.auto_resolve_all(limit=max(1, int(limit)))
+    resolved = 0
+    needs_human = 0
+    for it in results:
+        if it.get("resolved"):
+            resolved += 1
+            subj = it.get("subject") or "?"
+            pred = it.get("predicate") or "?"
+            chosen = it.get("chosen") or "?"
+            store.db.add_insight(
+                kind="judge_resolved",
+                title="Juiz interno atualizou crença",
+                text=f"Auto-correção: '{subj} {pred}' => '{chosen}'.",
+                priority=5,
+                conflict_id=it.get("conflict_id"),
+            )
+        elif it.get("needs_human"):
+            needs_human += 1
+            subj = it.get("subject") or "?"
+            pred = it.get("predicate") or "?"
+            store.db.add_insight(
+                kind="judge_needs_human",
+                title="Juiz pediu revisão humana",
+                text=f"Não consegui fechar sozinho: '{subj} {pred}'. Preciso de evidência melhor para síntese final.",
+                priority=4,
+                conflict_id=it.get("conflict_id"),
+            )
+
+    if resolved or needs_human:
+        store.db.add_event("judge_cycle", f"⚖️ juiz({source}): resolved={resolved}, needs_human={needs_human}, attempted={len(results)}")
+
+    return {"open_conflicts": open_conf, "resolved": resolved, "needs_human": needs_human, "attempted": len(results)}
 
 
 def _run_synthesis_cycle(max_items: int = 1) -> dict:
@@ -557,8 +683,8 @@ async def _execute_next_action() -> dict | None:
             ])
             store.db.add_event("action_done", f"🤖 ação #{aid}: clarify_laws")
         elif kind == "auto_resolve_conflicts":
-            r = await conflicts.auto_resolve_all(limit=1)
-            store.db.add_event("action_done", f"🤖 ação #{aid}: auto_resolve_conflicts ({len(r)} tentativas)")
+            jr = await _run_judge_cycle(limit=1, source="action")
+            store.db.add_event("action_done", f"🤖 ação #{aid}: auto_resolve_conflicts ({jr.get('attempted')} tentativas, resolved={jr.get('resolved')})")
         elif kind == "curate_memory":
             info = _run_memory_curation(batch_size=30)
             store.db.add_event("action_done", f"🤖 ação #{aid}: curate_memory ({info.get('scanned')} itens)")
@@ -651,6 +777,12 @@ async def autonomy_loop():
             except Exception as e:
                 logger.debug(f"Goal planning skipped: {e}")
 
+            # metas persistentes proativas (não dependem de conflito)
+            try:
+                _enqueue_from_persistent_goal()
+            except Exception as e:
+                logger.debug(f"Persistent goals skipped: {e}")
+
             # metacognição (Etapa D)
             try:
                 _metacognition_tick()
@@ -683,6 +815,18 @@ async def autonomy_loop():
                 store.db.add_event("circuit_breaker", "🛑 Circuit breaker ativo por 120s após falhas consecutivas")
 
         await asyncio.sleep(45)
+
+
+async def judge_loop():
+    """Loop dedicado do Juiz para auto-correção contínua."""
+    logger.info("Judge loop started")
+    await asyncio.sleep(25)
+    while True:
+        try:
+            await _run_judge_cycle(limit=2, source="judge_loop")
+        except Exception as e:
+            logger.error(f"Judge loop error: {e}")
+        await asyncio.sleep(30)
 
 
 async def autofeeder_loop():
@@ -741,7 +885,7 @@ async def autofeeder_loop():
 
 @app.on_event("startup")
 async def startup_event():
-    global _autofeeder_task, _autonomy_task
+    global _autofeeder_task, _autonomy_task, _judge_task
     logger.info("Starting UltronPRO...")
     store.init_db()
     graph.init()
@@ -760,12 +904,13 @@ async def startup_event():
     # Start background loops
     _autofeeder_task = asyncio.create_task(autofeeder_loop())
     _autonomy_task = asyncio.create_task(autonomy_loop())
-    logger.info("Autofeeder + Autonomy tasks created")
+    _judge_task = asyncio.create_task(judge_loop())
+    logger.info("Autofeeder + Autonomy + Judge tasks created")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global _autofeeder_task, _autonomy_task
-    for t in (_autofeeder_task, _autonomy_task):
+    global _autofeeder_task, _autonomy_task, _judge_task
+    for t in (_autofeeder_task, _autonomy_task, _judge_task):
         if t:
             t.cancel()
             try:
@@ -878,6 +1023,17 @@ async def get_triples(since_id: int = 0, limit: int = 500):
 async def get_events(since_id: int = 0, limit: int = 50):
     return {"events": store.get_events(since_id, limit)}
 
+@app.get("/api/insights")
+async def get_insights(limit: int = 50, query: str = ""):
+    if (query or "").strip():
+        return {"insights": store.search_insights(query, limit)}
+    return {"insights": store.list_insights(limit)}
+
+@app.post("/api/insights/emit")
+async def emit_insight(title: str, text: str, kind: str = "manual", priority: int = 3):
+    iid = store.add_insight(kind=kind, title=title, text=text, priority=priority)
+    return {"status": "ok", "id": iid}
+
 @app.get("/api/sources")
 async def get_sources(limit: int = 50):
     return {"sources": store.get_sources(limit)}
@@ -914,15 +1070,24 @@ async def get_conflict(id: int):
 @app.post("/api/conflicts/auto-resolve")
 async def auto_resolve_conflicts():
     """Use LLM to attempt auto-resolution of open conflicts."""
-    results = await conflicts.auto_resolve_all()
-    resolved = len([r for r in results if r.get("resolved")])
-    needs_human = len([r for r in results if r.get("needs_human")])
-    return {"resolved": resolved, "needs_human": needs_human, "results": results}
+    info = await _run_judge_cycle(limit=3, source="api")
+    return info
 
 
 @app.get("/api/conflicts-prioritized")
 async def prioritized_conflicts(limit: int = 10):
     return {"conflicts": store.db.list_prioritized_conflicts(limit=limit)}
+
+
+@app.get("/api/judge/status")
+async def judge_status():
+    open_conf = len(store.db.list_conflicts(status="open", limit=500))
+    return {"open_conflicts": open_conf, "retry_cooldown_hours": 1.0}
+
+
+@app.post("/api/judge/run")
+async def judge_run(limit: int = 2):
+    return await _run_judge_cycle(limit=limit, source="manual")
 
 
 @app.post("/api/conflicts/synthesis/run")
@@ -1196,6 +1361,89 @@ async def memory_curation_run(batch: int = 30):
 
 
 # --- Goals ---
+
+@app.get("/api/goals/persistent")
+async def persistent_goals_list():
+    data = _persistent_goals_load()
+    active = _persistent_goal_active()
+    return {"goals": data.get("goals", []), "active": active, "active_id": data.get("active_id")}
+
+
+@app.post("/api/goals/persistent")
+async def persistent_goals_add(req: PersistentGoalRequest):
+    t = (req.title or "").strip()
+    if not t:
+        raise HTTPException(400, "title required")
+
+    data = _persistent_goals_load()
+    gid = f"pg_{int(time.time())}_{secrets.token_hex(3)}"
+    actions = req.proactive_actions or [
+        f"Que evidência devo coletar hoje para avançar: {t}?",
+        f"Qual experimento mental simples valida a meta: {t}?",
+    ]
+    interval_min = max(5, int(req.interval_min or 60))
+    active_hours = req.active_hours if (req.active_hours and len(req.active_hours) == 2) else [8, 23]
+    g = {
+        "id": gid,
+        "title": t,
+        "description": (req.description or "").strip() or None,
+        "proactive_actions": actions[:8],
+        "interval_min": interval_min,
+        "active_hours": [int(active_hours[0]), int(active_hours[1])],
+        "last_run_at": 0,
+        "created_at": int(time.time()),
+    }
+    data.setdefault("goals", []).append(g)
+    if not data.get("active_id"):
+        data["active_id"] = gid
+    _persistent_goals_save(data)
+    store.db.add_event("persistent_goal_added", f"🎯 meta persistente criada: {t}")
+    return {"status": "ok", "goal": g, "active_id": data.get("active_id")}
+
+
+@app.post("/api/goals/persistent/{goal_id}/activate")
+async def persistent_goals_activate(goal_id: str):
+    data = _persistent_goals_load()
+    exists = any(g.get("id") == goal_id for g in data.get("goals", []))
+    if not exists:
+        raise HTTPException(404, "Persistent goal not found")
+    data["active_id"] = goal_id
+    _persistent_goals_save(data)
+    store.db.add_event("persistent_goal_activated", f"🎯 meta persistente ativada: {goal_id}")
+    return {"status": "ok", "active_id": goal_id}
+
+
+@app.post("/api/goals/persistent/{goal_id}/schedule")
+async def persistent_goals_schedule(goal_id: str, interval_min: int = 60, start_hour: int = 8, end_hour: int = 23):
+    data = _persistent_goals_load()
+    found = False
+    for g in data.get("goals", []):
+        if g.get("id") == goal_id:
+            g["interval_min"] = max(5, int(interval_min))
+            g["active_hours"] = [max(0, min(23, int(start_hour))), max(0, min(23, int(end_hour)))]
+            found = True
+            break
+    if not found:
+        raise HTTPException(404, "Persistent goal not found")
+    _persistent_goals_save(data)
+    store.db.add_event("persistent_goal_scheduled", f"🗓️ meta persistente agenda atualizada: {goal_id}")
+    return {"status": "ok", "goal_id": goal_id}
+
+
+@app.delete("/api/goals/persistent/{goal_id}")
+async def persistent_goals_delete(goal_id: str):
+    data = _persistent_goals_load()
+    goals0 = data.get("goals", [])
+    goals1 = [g for g in goals0 if g.get("id") != goal_id]
+    if len(goals1) == len(goals0):
+        raise HTTPException(404, "Persistent goal not found")
+    data["goals"] = goals1
+    if data.get("active_id") == goal_id:
+        data["active_id"] = goals1[0].get("id") if goals1 else None
+    _persistent_goals_save(data)
+    store.db.add_event("persistent_goal_deleted", f"🗑️ meta persistente removida: {goal_id}")
+    return {"status": "ok", "active_id": data.get("active_id")}
+
 
 @app.get("/api/goals")
 async def goals_list(status: str = "all", limit: int = 30):
