@@ -224,6 +224,76 @@ class Store:
                 )
                 """
             )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS procedures(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  created_at REAL NOT NULL,
+                  updated_at REAL,
+                  status TEXT NOT NULL DEFAULT 'active',
+                  domain TEXT,
+                  proc_type TEXT NOT NULL DEFAULT 'analysis',
+                  name TEXT NOT NULL,
+                  goal TEXT,
+                  preconditions TEXT,
+                  steps_json TEXT NOT NULL,
+                  success_criteria TEXT,
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  successes INTEGER NOT NULL DEFAULT 0,
+                  avg_score REAL NOT NULL DEFAULT 0.0,
+                  source_experience_id INTEGER
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS procedure_runs(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  procedure_id INTEGER NOT NULL,
+                  created_at REAL NOT NULL,
+                  input_text TEXT,
+                  output_text TEXT,
+                  score REAL,
+                  success INTEGER,
+                  notes TEXT,
+                  FOREIGN KEY(procedure_id) REFERENCES procedures(id)
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS analogies(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  created_at REAL NOT NULL,
+                  updated_at REAL,
+                  status TEXT NOT NULL DEFAULT 'hypothesis',
+                  source_domain TEXT,
+                  target_domain TEXT,
+                  source_concept TEXT,
+                  target_concept TEXT,
+                  mapping_json TEXT,
+                  inference_rule TEXT,
+                  confidence REAL NOT NULL DEFAULT 0.5,
+                  evidence_refs_json TEXT,
+                  notes TEXT
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS global_workspace(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  created_at REAL NOT NULL,
+                  module TEXT NOT NULL,
+                  channel TEXT NOT NULL,
+                  payload_json TEXT,
+                  salience REAL NOT NULL DEFAULT 0.5,
+                  ttl_sec INTEGER NOT NULL DEFAULT 900,
+                  expires_at REAL,
+                  consumed_by_json TEXT
+                )
+                """
+            )
 
             # lightweight migrations (add columns if upgrading)
 
@@ -282,6 +352,15 @@ class Store:
                 if col not in act_cols:
                     try:
                         c.execute(ddl)
+                    except Exception:
+                        pass
+
+            # migrations for procedures
+            if c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='procedures'").fetchone():
+                pcols = {r[1] for r in c.execute("PRAGMA table_info(procedures)").fetchall()}
+                if "proc_type" not in pcols:
+                    try:
+                        c.execute("ALTER TABLE procedures ADD COLUMN proc_type TEXT NOT NULL DEFAULT 'analysis'")
                     except Exception:
                         pass
 
@@ -975,6 +1054,241 @@ class Store:
         with self._conn() as c:
             c.execute("UPDATE goals SET status='done' WHERE id=?", (int(goal_id),))
 
+    # --- procedures (procedural memory)
+    def add_procedure(
+        self,
+        name: str,
+        goal: str | None,
+        steps_json: str,
+        domain: str | None = None,
+        proc_type: str = 'analysis',
+        preconditions: str | None = None,
+        success_criteria: str | None = None,
+        source_experience_id: int | None = None,
+    ) -> int:
+        now = _ts()
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                INSERT INTO procedures(created_at,updated_at,status,domain,proc_type,name,goal,preconditions,steps_json,success_criteria,source_experience_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (now, now, 'active', domain, (proc_type or 'analysis')[:40], (name or '')[:140], goal, preconditions, steps_json, success_criteria, source_experience_id),
+            )
+            return int(cur.lastrowid)
+
+    def list_procedures(self, limit: int = 50, domain: str | None = None) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            if domain:
+                rows = c.execute(
+                    """
+                    SELECT id, created_at, updated_at, status, domain, proc_type, name, goal, preconditions, steps_json, success_criteria,
+                           attempts, successes, avg_score, source_experience_id
+                    FROM procedures
+                    WHERE status='active' AND domain=?
+                    ORDER BY avg_score DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (domain, int(limit)),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    """
+                    SELECT id, created_at, updated_at, status, domain, proc_type, name, goal, preconditions, steps_json, success_criteria,
+                           attempts, successes, avg_score, source_experience_id
+                    FROM procedures
+                    WHERE status='active'
+                    ORDER BY avg_score DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                ).fetchall()
+        return [dict(r) for r in rows][::-1]
+
+    def get_procedure(self, procedure_id: int) -> dict[str, Any] | None:
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT id, created_at, updated_at, status, domain, proc_type, name, goal, preconditions, steps_json, success_criteria,
+                       attempts, successes, avg_score, source_experience_id
+                FROM procedures
+                WHERE id=?
+                """,
+                (int(procedure_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def add_procedure_run(
+        self,
+        procedure_id: int,
+        input_text: str | None,
+        output_text: str | None,
+        score: float,
+        success: bool,
+        notes: str | None = None,
+    ) -> int:
+        now = _ts()
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                INSERT INTO procedure_runs(procedure_id,created_at,input_text,output_text,score,success,notes)
+                VALUES(?,?,?,?,?,?,?)
+                """,
+                (int(procedure_id), now, input_text, output_text, float(score), 1 if success else 0, notes),
+            )
+
+            prow = c.execute(
+                "SELECT attempts, successes, avg_score FROM procedures WHERE id=?",
+                (int(procedure_id),),
+            ).fetchone()
+            if prow:
+                attempts = int(prow[0] or 0) + 1
+                successes = int(prow[1] or 0) + (1 if success else 0)
+                prev_avg = float(prow[2] or 0.0)
+                new_avg = ((prev_avg * (attempts - 1)) + float(score)) / max(1, attempts)
+                c.execute(
+                    "UPDATE procedures SET attempts=?, successes=?, avg_score=?, updated_at=? WHERE id=?",
+                    (attempts, successes, new_avg, now, int(procedure_id)),
+                )
+
+            return int(cur.lastrowid)
+
+    # --- analogies (cross-domain transfer)
+    def add_analogy(
+        self,
+        source_domain: str | None,
+        target_domain: str | None,
+        source_concept: str | None,
+        target_concept: str | None,
+        mapping_json: str | None,
+        inference_rule: str | None,
+        confidence: float = 0.5,
+        status: str = 'hypothesis',
+        evidence_refs_json: str | None = None,
+        notes: str | None = None,
+    ) -> int:
+        now = _ts()
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                INSERT INTO analogies(created_at,updated_at,status,source_domain,target_domain,source_concept,target_concept,mapping_json,inference_rule,confidence,evidence_refs_json,notes)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    now,
+                    now,
+                    (status or 'hypothesis')[:24],
+                    source_domain,
+                    target_domain,
+                    source_concept,
+                    target_concept,
+                    mapping_json,
+                    inference_rule,
+                    float(confidence),
+                    evidence_refs_json,
+                    notes,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def list_analogies(self, limit: int = 50, status: str | None = None, target_domain: str | None = None) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            q = """
+                SELECT id, created_at, updated_at, status, source_domain, target_domain, source_concept, target_concept,
+                       mapping_json, inference_rule, confidence, evidence_refs_json, notes
+                FROM analogies
+                WHERE 1=1
+            """
+            params: list[Any] = []
+            if status:
+                q += " AND status=?"
+                params.append(status)
+            if target_domain:
+                q += " AND target_domain=?"
+                params.append(target_domain)
+            q += " ORDER BY confidence DESC, id DESC LIMIT ?"
+            params.append(int(limit))
+            rows = c.execute(q, tuple(params)).fetchall()
+        return [dict(r) for r in rows][::-1]
+
+    def update_analogy_status(self, analogy_id: int, status: str, confidence: float | None = None, notes: str | None = None):
+        with self._conn() as c:
+            c.execute(
+                """
+                UPDATE analogies
+                SET status=?, updated_at=?, confidence=COALESCE(?,confidence), notes=COALESCE(?,notes)
+                WHERE id=?
+                """,
+                ((status or 'hypothesis')[:24], _ts(), float(confidence) if confidence is not None else None, notes, int(analogy_id)),
+            )
+
+    # --- global workspace (metacognição compartilhada)
+    def publish_workspace(
+        self,
+        module: str,
+        channel: str,
+        payload_json: str | None,
+        salience: float = 0.5,
+        ttl_sec: int = 900,
+    ) -> int:
+        now = _ts()
+        exp = now + max(30, int(ttl_sec or 900))
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                INSERT INTO global_workspace(created_at,module,channel,payload_json,salience,ttl_sec,expires_at,consumed_by_json)
+                VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (now, (module or 'unknown')[:60], (channel or 'general')[:80], payload_json, float(salience), int(ttl_sec), exp, '{}'),
+            )
+            return int(cur.lastrowid)
+
+    def read_workspace(self, channels: list[str] | None = None, limit: int = 30, include_expired: bool = False) -> list[dict[str, Any]]:
+        now = _ts()
+        with self._conn() as c:
+            if channels:
+                ph = ",".join(["?" for _ in channels])
+                q = f"""
+                    SELECT id, created_at, module, channel, payload_json, salience, ttl_sec, expires_at, consumed_by_json
+                    FROM global_workspace
+                    WHERE channel IN ({ph})
+                """
+                params: list[Any] = list(channels)
+                if not include_expired:
+                    q += " AND (expires_at IS NULL OR expires_at > ?)"
+                    params.append(now)
+                q += " ORDER BY salience DESC, id DESC LIMIT ?"
+                params.append(int(limit))
+                rows = c.execute(q, tuple(params)).fetchall()
+            else:
+                q = """
+                    SELECT id, created_at, module, channel, payload_json, salience, ttl_sec, expires_at, consumed_by_json
+                    FROM global_workspace
+                """
+                params2: list[Any] = []
+                if not include_expired:
+                    q += " WHERE (expires_at IS NULL OR expires_at > ?)"
+                    params2.append(now)
+                q += " ORDER BY salience DESC, id DESC LIMIT ?"
+                params2.append(int(limit))
+                rows = c.execute(q, tuple(params2)).fetchall()
+        return [dict(r) for r in rows][::-1]
+
+    def mark_workspace_consumed(self, item_id: int, consumer_module: str):
+        with self._conn() as c:
+            row = c.execute("SELECT consumed_by_json FROM global_workspace WHERE id=?", (int(item_id),)).fetchone()
+            if not row:
+                return
+            try:
+                data = row[0] or '{}'
+                d = __import__('json').loads(data)
+                if not isinstance(d, dict):
+                    d = {}
+            except Exception:
+                d = {}
+            d[(consumer_module or 'unknown')[:60]] = _ts()
+            c.execute("UPDATE global_workspace SET consumed_by_json=? WHERE id=?", (__import__('json').dumps(d, ensure_ascii=False), int(item_id)))
+
     # --- questions
     def list_open_questions(self, limit: int = 50) -> list[str]:
         with self._conn() as c:
@@ -1041,9 +1355,22 @@ class Store:
 
     def next_question(self) -> dict[str, Any] | None:
         with self._conn() as c:
+            # ensure adaptive columns exist
+            cols = {r[1] for r in c.execute("PRAGMA table_info(questions)").fetchall()}
+            if "template_id" not in cols:
+                try:
+                    c.execute("ALTER TABLE questions ADD COLUMN template_id TEXT")
+                except Exception:
+                    pass
+            if "concept" not in cols:
+                try:
+                    c.execute("ALTER TABLE questions ADD COLUMN concept TEXT")
+                except Exception:
+                    pass
+
             row = c.execute(
                 """
-                SELECT id, question, context, priority, created_at
+                SELECT id, question, context, priority, created_at, template_id, concept
                 FROM questions
                 WHERE status='open'
                 ORDER BY priority DESC, id ASC
@@ -1051,6 +1378,20 @@ class Store:
                 """
             ).fetchone()
         return dict(row) if row else None
+
+    def list_open_questions_full(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, question, context, priority, created_at, template_id, concept
+                FROM questions
+                WHERE status='open'
+                ORDER BY priority DESC, id ASC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def answer_question(self, qid: int, answer: str):
         with self._conn() as c:
@@ -1796,6 +2137,9 @@ def mark_question_answered(qid: int, answer: str):
 def dismiss_question(qid: int):
     return db.dismiss_question(qid)
 
+def list_open_questions_full(limit: int = 50):
+    return db.list_open_questions_full(limit=limit)
+
 def get_triples(since_id: int = 0, limit: int = 500):
     return db.list_triples_since(since_id, limit)
 
@@ -1828,6 +2172,36 @@ def upsert_goal(title: str, description: str | None = None, priority: int = 0):
 
 def list_goals(status: str | None = None, limit: int = 50):
     return db.list_goals(status=status, limit=limit)
+
+def add_procedure(name: str, goal: str | None, steps_json: str, domain: str | None = None, proc_type: str = 'analysis', preconditions: str | None = None, success_criteria: str | None = None, source_experience_id: int | None = None):
+    return db.add_procedure(name, goal, steps_json, domain=domain, proc_type=proc_type, preconditions=preconditions, success_criteria=success_criteria, source_experience_id=source_experience_id)
+
+def list_procedures(limit: int = 50, domain: str | None = None):
+    return db.list_procedures(limit=limit, domain=domain)
+
+def get_procedure(procedure_id: int):
+    return db.get_procedure(procedure_id)
+
+def add_procedure_run(procedure_id: int, input_text: str | None, output_text: str | None, score: float, success: bool, notes: str | None = None):
+    return db.add_procedure_run(procedure_id, input_text, output_text, score=score, success=success, notes=notes)
+
+def add_analogy(source_domain: str | None, target_domain: str | None, source_concept: str | None, target_concept: str | None, mapping_json: str | None, inference_rule: str | None, confidence: float = 0.5, status: str = 'hypothesis', evidence_refs_json: str | None = None, notes: str | None = None):
+    return db.add_analogy(source_domain, target_domain, source_concept, target_concept, mapping_json, inference_rule, confidence=confidence, status=status, evidence_refs_json=evidence_refs_json, notes=notes)
+
+def list_analogies(limit: int = 50, status: str | None = None, target_domain: str | None = None):
+    return db.list_analogies(limit=limit, status=status, target_domain=target_domain)
+
+def update_analogy_status(analogy_id: int, status: str, confidence: float | None = None, notes: str | None = None):
+    return db.update_analogy_status(analogy_id, status=status, confidence=confidence, notes=notes)
+
+def publish_workspace(module: str, channel: str, payload_json: str | None, salience: float = 0.5, ttl_sec: int = 900):
+    return db.publish_workspace(module, channel, payload_json, salience=salience, ttl_sec=ttl_sec)
+
+def read_workspace(channels: list[str] | None = None, limit: int = 30, include_expired: bool = False):
+    return db.read_workspace(channels=channels, limit=limit, include_expired=include_expired)
+
+def mark_workspace_consumed(item_id: int, consumer_module: str):
+    return db.mark_workspace_consumed(item_id, consumer_module)
 
 def get_active_goal():
     return db.get_active_goal()

@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-from ultronpro import llm, knowledge_bridge, graph, settings, curiosity, conflicts, store, extract, planner, goals, autofeeder, policy
+from ultronpro import llm, knowledge_bridge, graph, settings, curiosity, conflicts, store, extract, planner, goals, autofeeder, policy, analogy
 from ultronpro.knowledge_bridge import search_knowledge, ingest_knowledge
 
 # Logging
@@ -67,6 +67,34 @@ class ActionPrepareRequest(BaseModel):
     payload: Optional[Dict[str, Any]] = None
     reason: str
 
+class ProcedureLearnRequest(BaseModel):
+    observation_text: str
+    domain: Optional[str] = None
+    name: Optional[str] = None
+
+class ProcedureRunRequest(BaseModel):
+    procedure_id: int
+    input_text: Optional[str] = None
+    output_text: Optional[str] = None
+    score: float = 0.5
+    success: bool = False
+    notes: Optional[str] = None
+
+class ProcedureSelectRequest(BaseModel):
+    context_text: str
+    domain: Optional[str] = None
+
+class AnalogyTransferRequest(BaseModel):
+    problem_text: str
+    target_domain: Optional[str] = None
+
+class WorkspacePublishRequest(BaseModel):
+    module: str
+    channel: str
+    payload: Dict[str, Any] = {}
+    salience: float = 0.5
+    ttl_sec: int = 900
+
 class PersistentGoalRequest(BaseModel):
     title: str
     description: Optional[str] = None
@@ -81,6 +109,15 @@ class ActionExecRequest(BaseModel):
     dry_run: bool = True
     reason: Optional[str] = None
     confirm_token: Optional[str] = None
+
+class SelfPatchPrepareRequest(BaseModel):
+    file_path: str
+    old_text: str
+    new_text: str
+    reason: str
+
+class SelfPatchApplyRequest(BaseModel):
+    token: str
 
 # --- Startup ---
 _autofeeder_task = None
@@ -110,13 +147,18 @@ ACTION_COOLDOWNS_SEC = {
     "clarify_laws": 300,
     "curate_memory": 300,
     "prune_memory": 420,
+    "execute_procedure": 180,
+    "execute_procedure_active": 240,
+    "generate_analogy_hypothesis": 300,
 }
 
 # Etapa E: executor externo com segurança
 EXTERNAL_ACTION_ALLOWLIST = {"notify_human"}
 _external_confirm_tokens: dict[str, dict] = {}
+_selfpatch_tokens: dict[str, dict] = {}
 BENCHMARK_HISTORY_PATH = Path("/app/data/benchmark_history.json")
 PERSISTENT_GOALS_PATH = Path("/app/data/persistent_goals.json")
+PROCEDURE_ARTIFACTS_DIR = Path("/app/data/procedure_artifacts")
 
 
 def _benchmark_history_load() -> list[dict]:
@@ -218,6 +260,26 @@ def _enqueue_from_persistent_goal():
     return count
 
 
+def _workspace_publish(module: str, channel: str, payload: dict, salience: float = 0.5, ttl_sec: int = 900) -> int:
+    try:
+        return store.publish_workspace(
+            module=module,
+            channel=channel,
+            payload_json=json.dumps(payload or {}, ensure_ascii=False),
+            salience=float(salience),
+            ttl_sec=int(ttl_sec),
+        )
+    except Exception:
+        return 0
+
+
+def _workspace_recent(channels: list[str] | None = None, limit: int = 20) -> list[dict]:
+    try:
+        return store.read_workspace(channels=channels, limit=limit)
+    except Exception:
+        return []
+
+
 def _latest_external_audit_hash() -> str | None:
     evs = store.db.list_events(limit=200)
     for e in reversed(evs):
@@ -236,6 +298,16 @@ def _compute_audit_hash(payload: dict) -> str:
     base = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     prev = _latest_external_audit_hash() or ""
     return hashlib.sha256((prev + "|" + base).encode("utf-8")).hexdigest()
+
+
+def _selfpatch_allowed(path_str: str) -> bool:
+    p = Path(path_str)
+    try:
+        rp = p.resolve()
+    except Exception:
+        return False
+    allowed_roots = [Path('/app/ultronpro').resolve(), Path('/app/ui').resolve()]
+    return any(str(rp).startswith(str(ar)) for ar in allowed_roots)
 
 
 def _recent_actions_count(seconds: int = 60) -> int:
@@ -334,7 +406,9 @@ async def _run_judge_cycle(limit: int = 2, source: str = "loop") -> dict:
     if resolved or needs_human:
         store.db.add_event("judge_cycle", f"⚖️ juiz({source}): resolved={resolved}, needs_human={needs_human}, attempted={len(results)}")
 
-    return {"open_conflicts": open_conf, "resolved": resolved, "needs_human": needs_human, "attempted": len(results)}
+    out = {"open_conflicts": open_conf, "resolved": resolved, "needs_human": needs_human, "attempted": len(results)}
+    _workspace_publish("judge", "conflict.status", out, salience=0.75 if needs_human else 0.45, ttl_sec=900)
+    return out
 
 
 def _run_synthesis_cycle(max_items: int = 1) -> dict:
@@ -509,7 +583,7 @@ def _metacognition_tick() -> dict:
     _autonomy_state["meta_quality_history"] = hist[-20:]
 
     _autonomy_state["meta_last_snapshot"] = snap
-    return {
+    out = {
         "decision_quality": round(float(quality), 3),
         "empty_activity": bool(empty_activity),
         "stuck_cycles": int(_autonomy_state.get("meta_stuck_cycles") or 0),
@@ -518,6 +592,41 @@ def _metacognition_tick() -> dict:
         "quality_history": list(_autonomy_state.get("meta_quality_history") or []),
         "snapshot": snap,
     }
+    _workspace_publish("metacognition", "metacog.snapshot", out, salience=0.75 if quality < 0.3 else 0.45, ttl_sec=900)
+    return out
+
+
+def _self_awareness_snapshot() -> dict:
+    """Modelo de autoconsciência funcional (não implica qualia real)."""
+    m = _metacognition_tick()
+    agi = _compute_agi_mode_metrics()
+    ws = _workspace_recent(channels=["metacog.snapshot", "conflict.status", "analogy.transfer", "procedure.execution"], limit=12)
+
+    dq = float(m.get("decision_quality") or 0.5)
+    stress = min(1.0, (float(m.get("stuck_cycles") or 0) * 0.25) + (float(m.get("low_quality_streak") or 0) * 0.2))
+    coherence = max(0.0, min(1.0, dq * 0.7 + (float(agi.get("agi_mode_percent") or 0) / 100.0) * 0.3))
+
+    phenomenology_proxy = {
+        "self_model": "functional-global-workspace",
+        "note": "Proxy computacional de experiência interna; não comprova qualia fenomenológica.",
+        "valence": round((coherence - stress), 3),
+        "arousal": round(stress, 3),
+        "sense_of_control": round(dq, 3),
+        "global_broadcast_load": len(ws),
+    }
+
+    report = {
+        "metacognition": m,
+        "agi": agi,
+        "phenomenology_proxy": phenomenology_proxy,
+        "first_person_report": (
+            f"Estado interno: controle={dq:.2f}, estresse={stress:.2f}, coerência={coherence:.2f}. "
+            f"Estou priorizando sinais de maior saliência no workspace global."
+        ),
+    }
+
+    _workspace_publish("self_model", "self.state", report, salience=0.85 if stress > 0.55 else 0.55, ttl_sec=1200)
+    return report
 
 
 def _goal_focus_terms() -> list[str]:
@@ -609,6 +718,361 @@ def _compute_agi_mode_metrics() -> dict:
     }
 
 
+def _infer_proc_type(domain: str | None, text: str) -> str:
+    d = (domain or '').lower()
+    t = (text or '').lower()
+    if any(x in d or x in t for x in ['python', 'code', 'program', 'script']):
+        return 'code'
+    if any(x in d or x in t for x in ['jogo', 'game', 'xadrez', 'chess', 'estratég']):
+        return 'strategy'
+    if any(x in d or x in t for x in ['api', 'query', 'buscar', 'search', 'fetch']):
+        return 'query'
+    if any(x in d or x in t for x in ['análise', 'analysis', 'diagnóstico', 'debug']):
+        return 'analysis'
+    return 'analysis'
+
+
+def _extract_procedure_from_text(observation_text: str, domain: str | None = None, name_hint: str | None = None) -> dict | None:
+    txt = (observation_text or '').strip()
+    if len(txt) < 20:
+        return None
+
+    # 1) tenta LLM
+    prompt = f"""Extract a procedural skill from the observation below.
+Return ONLY JSON with keys:
+name, goal, domain, preconditions, steps (array of imperative strings), success_criteria.
+Observation:\n{txt[:3500]}"""
+    try:
+        raw = llm.complete(prompt, strategy='reasoning', json_mode=True)
+        data = json.loads(raw) if raw else {}
+        steps = data.get('steps') if isinstance(data, dict) else None
+        if isinstance(steps, list) and steps:
+            dom = (domain or data.get('domain') or 'general').strip()
+            return {
+                'name': (name_hint or data.get('name') or 'Procedimento aprendido').strip(),
+                'goal': data.get('goal'),
+                'domain': dom,
+                'proc_type': _infer_proc_type(dom, txt),
+                'preconditions': data.get('preconditions'),
+                'steps': [str(s).strip() for s in steps if str(s).strip()][:20],
+                'success_criteria': data.get('success_criteria'),
+            }
+    except Exception:
+        pass
+
+    # 2) fallback regex (sem depender de LLM)
+    import re
+    parts = re.split(r"(?:^|\n|\s)(?:\d+\)|\d+\.|-\s)", txt)
+    steps = [re.sub(r"\s+", " ", p).strip(' .;:-') for p in parts if len(re.sub(r"\s+", " ", p).strip()) > 6]
+    if len(steps) < 2:
+        # split por frases imperativas simples
+        sents = re.split(r"[\.;\n]", txt)
+        steps = [re.sub(r"\s+", " ", s).strip() for s in sents if len(s.strip()) > 8][:8]
+
+    if len(steps) < 2:
+        return None
+
+    dom = (domain or 'general').strip()
+    return {
+        'name': (name_hint or 'Procedimento aprendido').strip(),
+        'goal': f"Executar procedimento observado: {(name_hint or 'tarefa')}",
+        'domain': dom,
+        'proc_type': _infer_proc_type(dom, txt),
+        'preconditions': None,
+        'steps': steps[:20],
+        'success_criteria': 'Executar passos com resultado útil e reproduzível',
+    }
+
+
+def _select_procedure(context_text: str, domain: str | None = None) -> dict | None:
+    ctx = (context_text or '').lower()
+    wanted_domain = (domain or '').strip().lower()
+
+    procs = store.list_procedures(limit=80, domain=domain)
+    if not procs and wanted_domain:
+        # fallback: tenta pool global e filtra por match parcial de domínio
+        allp = store.list_procedures(limit=80, domain=None)
+        procs = [p for p in allp if wanted_domain in str((p.get('domain') or '')).lower()]
+    if not procs:
+        return None
+
+    def score(p: dict) -> float:
+        name = (p.get('name') or '').lower()
+        goal = (p.get('goal') or '').lower()
+        d = (p.get('domain') or '').lower()
+        ptype = (p.get('proc_type') or 'analysis').lower()
+        att = int(p.get('attempts') or 0)
+        suc = int(p.get('successes') or 0)
+        sr = suc / max(1, att)
+        base = float(p.get('avg_score') or 0.0) * 0.5 + sr * 0.3
+        overlap = 0.0
+        words = set([x for x in ctx.split() if len(x) >= 4][:24])
+        for w in words:
+            if w in name or w in goal:
+                overlap += 0.08
+            if d and w in d:
+                overlap += 0.12
+        if wanted_domain and d and (wanted_domain in d or d in wanted_domain):
+            overlap += 0.2
+
+        # preferência por tipo de procedimento conforme contexto
+        if any(k in ctx for k in ['python','código','codigo','função','funcao','script']) and ptype == 'code':
+            overlap += 0.25
+        if any(k in ctx for k in ['jogo','game','xadrez','chess']) and ptype == 'strategy':
+            overlap += 0.25
+        if any(k in ctx for k in ['buscar','consulta','query','search','api']) and ptype == 'query':
+            overlap += 0.25
+
+        return base + min(0.8, overlap)
+
+    ranked = sorted(procs, key=score, reverse=True)
+    best = ranked[0]
+    if score(best) < 0.05:
+        return None
+    return best
+
+
+def _evaluate_procedure_output(output_text: str, success_criteria: str | None = None) -> tuple[float, bool]:
+    out = (output_text or '').strip()
+    if not out:
+        return 0.0, False
+
+    # fallback heurístico
+    score = 0.45
+    if len(out) > 120:
+        score += 0.15
+    if 'erro' not in out.lower() and 'failed' not in out.lower():
+        score += 0.1
+    if success_criteria and any(w in out.lower() for w in str(success_criteria).lower().split()[:6]):
+        score += 0.15
+
+    # tenta avaliação LLM quando disponível
+    try:
+        prompt = f"""Evaluate this procedure output.
+Return ONLY JSON: {{"score":0..1, "success":true/false}}.
+Success criteria: {success_criteria or 'N/A'}
+Output:\n{out[:2000]}"""
+        raw = llm.complete(prompt, strategy='cheap', json_mode=True)
+        d = json.loads(raw) if raw else {}
+        if isinstance(d, dict) and d.get('score') is not None:
+            lscore = float(d.get('score') or 0)
+            lsuccess = bool(d.get('success'))
+            score = (score * 0.4) + (lscore * 0.6)
+            return max(0.0, min(1.0, score)), bool(lsuccess or score >= 0.62)
+    except Exception:
+        pass
+
+    score = max(0.0, min(1.0, score))
+    return score, bool(score >= 0.62)
+
+
+def _execute_procedure_simulation(procedure_id: int, input_text: str | None = None) -> dict:
+    p = store.get_procedure(procedure_id)
+    if not p:
+        return {"ok": False, "error": "procedure not found"}
+
+    try:
+        steps = json.loads(p.get('steps_json') or '[]')
+    except Exception:
+        steps = []
+
+    if not steps:
+        return {"ok": False, "error": "procedure has no steps"}
+
+    ptype = (p.get('proc_type') or 'analysis').lower()
+    in_txt = (input_text or '').strip()
+
+    # executor fase 3: tipos de procedimento
+    if ptype == 'code':
+        executed = [f"[code-plan] {s}" for s in steps[:8]]
+        skeleton = "def solution(input_data):\n    \"\"\"auto-generated skeleton\"\"\"\n    # TODO: implement steps\n    return input_data\n"
+        out = "\n".join(executed) + "\n\n" + skeleton
+    elif ptype == 'query':
+        executed = [f"[query-plan] {s}" for s in steps[:8]]
+        out = "\n".join(executed) + f"\n\nquery_context={in_txt[:180]}"
+    elif ptype == 'strategy':
+        executed = [f"[strategy-step] {s}" for s in steps[:8]]
+        out = "\n".join(executed) + "\n\nnext_move_heuristic: maximize position advantage"
+    else:
+        executed = [f"[analysis-step] {s}" for s in steps[:8]]
+        out = "\n".join(executed)
+
+    score, success = _evaluate_procedure_output(out, success_criteria=p.get('success_criteria'))
+
+    run_id = store.add_procedure_run(
+        procedure_id=procedure_id,
+        input_text=input_text,
+        output_text=out,
+        score=score,
+        success=success,
+        notes=f'simulated execution type={ptype}',
+    )
+
+    store.db.add_insight(
+        kind='procedure_executed',
+        title='Procedimento praticado',
+        text=f"Pratiquei '{p.get('name')}' [{ptype}]. Score={score:.2f}, success={success}.",
+        priority=3,
+    )
+
+    return {"ok": True, "run_id": run_id, "score": score, "success": success, "output": out, "procedure": p.get('name'), "proc_type": ptype}
+
+
+def _execute_procedure_active(procedure_id: int, input_text: str | None = None, notify: bool = False) -> dict:
+    """Executor procedural com efeitos reais locais (e notificação opcional)."""
+    p = store.get_procedure(procedure_id)
+    if not p:
+        return {"ok": False, "error": "procedure not found"}
+
+    try:
+        steps = json.loads(p.get('steps_json') or '[]')
+    except Exception:
+        steps = []
+    if not steps:
+        return {"ok": False, "error": "procedure has no steps"}
+
+    ptype = (p.get('proc_type') or 'analysis').lower()
+    in_txt = (input_text or '').strip()
+    PROCEDURE_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time())
+
+    artifact_path = None
+    out = ""
+
+    if ptype == 'code':
+        artifact_path = PROCEDURE_ARTIFACTS_DIR / f"proc_{procedure_id}_{ts}.py"
+        code = (
+            "def solution(input_data):\n"
+            "    \"\"\"Generated by Ultron procedural executor\"\"\"\n"
+            "    # Steps:\n"
+            + "\n".join([f"    # - {str(s)[:120]}" for s in steps[:10]])
+            + "\n    return input_data\n"
+        )
+        artifact_path.write_text(code)
+        out = f"wrote_code_artifact={artifact_path}\nsteps={len(steps[:10])}"
+    elif ptype == 'query':
+        q = (in_txt or p.get('goal') or p.get('name') or 'general').strip()[:220]
+        try:
+            kb = search_knowledge(q, top_k=5)
+            txt = json.dumps(kb, ensure_ascii=False)[:4000]
+        except Exception as e:
+            txt = f"query_error: {e}"
+        artifact_path = PROCEDURE_ARTIFACTS_DIR / f"proc_{procedure_id}_{ts}.query.txt"
+        artifact_path.write_text(txt)
+        out = f"query='{q}'\nresult_artifact={artifact_path}"
+    elif ptype == 'strategy':
+        plan = {
+            "procedure": p.get('name'),
+            "input": in_txt[:500],
+            "steps": [str(s)[:180] for s in steps[:12]],
+            "heuristic": "maximize expected utility under constraints",
+            "created_at": ts,
+        }
+        artifact_path = PROCEDURE_ARTIFACTS_DIR / f"proc_{procedure_id}_{ts}.strategy.json"
+        artifact_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2))
+        out = f"strategy_plan_artifact={artifact_path}"
+    else:
+        report = "\n".join([f"- {str(s)[:180]}" for s in steps[:12]])
+        artifact_path = PROCEDURE_ARTIFACTS_DIR / f"proc_{procedure_id}_{ts}.analysis.md"
+        artifact_path.write_text(f"# Procedural Analysis\n\n## Procedure\n{p.get('name')}\n\n## Input\n{in_txt[:800]}\n\n## Steps\n{report}\n")
+        out = f"analysis_artifact={artifact_path}"
+
+    score, success = _evaluate_procedure_output(out, success_criteria=p.get('success_criteria'))
+    run_id = store.add_procedure_run(
+        procedure_id=procedure_id,
+        input_text=input_text,
+        output_text=out,
+        score=score,
+        success=success,
+        notes=f'active execution type={ptype}',
+    )
+
+    store.db.add_event(
+        'procedure_active_executed',
+        f"⚙️ active procedure '{p.get('name')}' [{ptype}] => {artifact_path}",
+        meta_json=json.dumps({"procedure_id": procedure_id, "proc_type": ptype, "artifact": str(artifact_path), "score": score, "success": success}, ensure_ascii=False),
+    )
+
+    if notify:
+        store.db.add_event(
+            'external_action_executed',
+            f"📣 notify_human: Procedimento '{p.get('name')}' executado ativamente (score={score:.2f}).",
+            meta_json=json.dumps({"kind": "notify_human", "audit_hash": _compute_audit_hash({"kind":"notify_human","procedure_id":procedure_id,"run_id":run_id})}, ensure_ascii=False),
+        )
+
+    _workspace_publish(
+        "procedural_executor",
+        "procedure.execution",
+        {"procedure_id": procedure_id, "name": p.get('name'), "proc_type": ptype, "score": score, "success": success, "artifact": str(artifact_path) if artifact_path else None},
+        salience=0.7 if not success else 0.5,
+        ttl_sec=1200,
+    )
+
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "score": score,
+        "success": success,
+        "procedure": p.get('name'),
+        "proc_type": ptype,
+        "artifact": str(artifact_path) if artifact_path else None,
+        "output": out,
+        "active": True,
+    }
+
+
+async def _run_analogy_transfer(problem_text: str, target_domain: str | None = None) -> dict:
+    kb_ctx: list[str] = []
+    try:
+        kb = await search_knowledge(problem_text[:240], top_k=5)
+        if isinstance(kb, list):
+            for it in kb[:5]:
+                if isinstance(it, dict):
+                    kb_ctx.append(str(it.get('content') or it.get('text') or '')[:320])
+                else:
+                    kb_ctx.append(str(it)[:320])
+    except Exception:
+        pass
+
+    cand = analogy.propose_analogy(problem_text, target_domain=target_domain, context_snippets=kb_ctx)
+    if not cand:
+        return {"status": "no_candidate"}
+
+    val = analogy.validate_analogy(cand)
+    applied = analogy.apply_analogy(cand, problem_text)
+    st = "accepted" if val.get('valid') else "rejected"
+
+    aid = store.add_analogy(
+        source_domain=cand.get('source_domain'),
+        target_domain=(target_domain or cand.get('target_domain')),
+        source_concept=cand.get('source_concept'),
+        target_concept=cand.get('target_concept'),
+        mapping_json=json.dumps(cand.get('mapping') or {}, ensure_ascii=False),
+        inference_rule=applied.get('derived_rule'),
+        confidence=float(val.get('confidence') or cand.get('confidence') or 0.5),
+        status=st,
+        evidence_refs_json=json.dumps(kb_ctx[:3], ensure_ascii=False),
+        notes="; ".join(val.get('reasons') or []),
+    )
+
+    store.db.add_insight(
+        kind='analogy_transfer',
+        title='Transferência por analogia',
+        text=f"Analogia {st}: {cand.get('source_domain')} -> {(target_domain or cand.get('target_domain'))}. Regra: {applied.get('derived_rule')}",
+        priority=4,
+        meta_json=json.dumps({"analogy_id": aid, "confidence": val.get('confidence'), "mapping": cand.get('mapping')}, ensure_ascii=False),
+    )
+    _workspace_publish(
+        "analogy",
+        "analogy.transfer",
+        {"status": st, "analogy_id": aid, "target_domain": (target_domain or cand.get('target_domain')), "confidence": val.get('confidence'), "derived_rule": applied.get('derived_rule')},
+        salience=0.8 if st == "accepted" else 0.55,
+        ttl_sec=1800,
+    )
+
+    return {"status": st, "analogy_id": aid, "candidate": cand, "validation": val, "applied": applied}
+
+
 def _goal_to_action(goal: dict) -> tuple[str, str, int, dict]:
     """Traduz objetivo ativo em próxima micro-ação barata."""
     gid = int(goal.get("id"))
@@ -691,6 +1155,29 @@ async def _execute_next_action() -> dict | None:
         elif kind == "prune_memory":
             n = store.db.prune_low_utility_experiences(limit=200, focus_terms=_goal_focus_terms())
             store.db.add_event("action_done", f"🤖 ação #{aid}: prune_memory ({n} arquivadas)")
+        elif kind == "execute_procedure":
+            pid = int((meta or {}).get('procedure_id') or 0)
+            if pid <= 0:
+                store.db.add_event("action_skipped", f"↷ ação #{aid} execute_procedure sem procedure_id")
+            else:
+                res = _execute_procedure_simulation(pid, input_text=(meta or {}).get('input_text'))
+                store.db.add_event("action_done", f"🤖 ação #{aid}: execute_procedure pid={pid} ok={res.get('ok')} score={res.get('score')}")
+        elif kind == "execute_procedure_active":
+            pid = int((meta or {}).get('procedure_id') or 0)
+            if pid <= 0:
+                store.db.add_event("action_skipped", f"↷ ação #{aid} execute_procedure_active sem procedure_id")
+            else:
+                res = _execute_procedure_active(
+                    pid,
+                    input_text=(meta or {}).get('input_text'),
+                    notify=bool((meta or {}).get('notify')),
+                )
+                store.db.add_event("action_done", f"🤖 ação #{aid}: execute_procedure_active pid={pid} ok={res.get('ok')} score={res.get('score')}")
+        elif kind == "generate_analogy_hypothesis":
+            ptxt = str((meta or {}).get('problem_text') or text or '')
+            td = (meta or {}).get('target_domain')
+            res = await _run_analogy_transfer(ptxt, target_domain=td)
+            store.db.add_event("action_done", f"🤖 ação #{aid}: generate_analogy_hypothesis status={res.get('status')}")
         else:
             store.db.add_event("action_skipped", f"↷ ação #{aid} desconhecida: {kind}")
 
@@ -760,12 +1247,56 @@ async def autonomy_loop():
                 )
                 _run_synthesis_cycle(max_items=1)
 
+                try:
+                    pc = store.db.list_prioritized_conflicts(limit=1)
+                    if pc:
+                        c0 = pc[0]
+                        _enqueue_action_if_new(
+                            "generate_analogy_hypothesis",
+                            f"(ação) Tentar transferência analógica para '{c0.get('subject')} {c0.get('predicate')}'.",
+                            priority=5,
+                            meta={
+                                "conflict_id": c0.get("id"),
+                                "problem_text": f"{c0.get('subject')} {c0.get('predicate')}",
+                                "target_domain": c0.get('predicate'),
+                            },
+                        )
+                except Exception as e:
+                    logger.debug(f"Analogy planning skipped: {e}")
+
             # plano (determinístico + ocasional improv)
             try:
                 for p in planner.propose_actions(store.db)[:3]:
                     _enqueue_action_if_new(p.kind, p.text, int(p.priority or 0), p.meta)
             except Exception as e:
                 logger.debug(f"Planner skipped: {e}")
+
+            # prática procedural (domínios não-declarativos)
+            try:
+                procs = store.db.list_procedures(limit=5)
+                for pr in procs:
+                    att = int(pr.get('attempts') or 0)
+                    suc = int(pr.get('successes') or 0)
+                    if att < 2 or (suc / max(1, att)) < 0.6:
+                        _enqueue_action_if_new(
+                            "ask_evidence",
+                            f"(ação-procedural) Praticar procedimento '{pr.get('name')}' e reportar passos executados + resultado.",
+                            priority=4,
+                            meta={"procedure_id": pr.get('id')},
+                        )
+
+                # seleção automática por contexto recente + execução simulada
+                recent_ctx = "\n".join([(e.get('text') or '') for e in store.db.list_experiences(limit=8)])
+                sel = _select_procedure(recent_ctx)
+                if sel:
+                    _enqueue_action_if_new(
+                        "execute_procedure_active",
+                        f"(ação-procedural) Executar ATIVO procedimento selecionado: {sel.get('name')}",
+                        priority=5,
+                        meta={"procedure_id": sel.get('id'), "input_text": recent_ctx[:300], "notify": False},
+                    )
+            except Exception as e:
+                logger.debug(f"Procedural planning skipped: {e}")
 
             # gestão de objetivos (Tarefa 2)
             try:
@@ -783,11 +1314,46 @@ async def autonomy_loop():
             except Exception as e:
                 logger.debug(f"Persistent goals skipped: {e}")
 
-            # metacognição (Etapa D)
+            # global workspace: acoplamento frouxo entre módulos
             try:
-                _metacognition_tick()
+                ws = _workspace_recent(channels=["metacog.snapshot", "analogy.transfer", "conflict.status"], limit=8)
+                for item in ws:
+                    ch = item.get("channel")
+                    payload = {}
+                    try:
+                        payload = json.loads(item.get("payload_json") or "{}")
+                    except Exception:
+                        payload = {}
+
+                    if ch == "metacog.snapshot":
+                        dq = float(payload.get("decision_quality") or 0.5)
+                        if dq < 0.25:
+                            _enqueue_action_if_new(
+                                "curate_memory",
+                                "(ação-workspace) baixa qualidade decisória detectada; executar curadoria para recuperar sinal.",
+                                priority=6,
+                            )
+                    elif ch == "analogy.transfer" and payload.get("status") == "accepted":
+                        _enqueue_action_if_new(
+                            "ask_evidence",
+                            f"(ação-workspace) Validar em evidência direta a regra analógica: {payload.get('derived_rule')}",
+                            priority=5,
+                            meta={"analogy_id": payload.get("analogy_id")},
+                        )
+                    elif ch == "conflict.status" and int(payload.get("needs_human") or 0) > 0:
+                        _enqueue_action_if_new(
+                            "ask_evidence",
+                            "(ação-workspace) Juiz pediu ajuda humana; solicitar evidência objetiva para conflitos críticos.",
+                            priority=6,
+                        )
             except Exception as e:
-                logger.debug(f"Metacognition skipped: {e}")
+                logger.debug(f"Workspace coupling skipped: {e}")
+
+            # metacognição (Etapa D) + auto-modelo global
+            try:
+                _self_awareness_snapshot()
+            except Exception as e:
+                logger.debug(f"Metacognition/self-model skipped: {e}")
 
             # budget por minuto
             if _recent_actions_count(60) >= AUTONOMY_BUDGET_PER_MIN:
@@ -1010,6 +1576,10 @@ async def answer_question(req: AnswerRequest):
 @app.post("/api/dismiss")
 async def dismiss_question(req: DismissRequest):
     """Dismiss/skip a question."""
+    try:
+        curiosity.mark_question_failure(req.question_id)
+    except Exception:
+        pass
     store.dismiss_question(req.question_id)
     return {"status": "dismissed"}
 
@@ -1046,14 +1616,21 @@ async def rebuild_sources(limit: int = 10000):
 # --- Curiosity ---
 
 @app.post("/api/curiosity/refresh")
-async def refresh_curiosity():
-    """Trigger LLM to generate new questions based on current graph state."""
-    count = curiosity.generate_questions()
-    return {"new_questions": count}
+async def refresh_curiosity(target_count: int = 5):
+    """Trigger adaptive curiosity generation."""
+    count = curiosity.refresh_questions(target_count=target_count)
+    oq = store.db.list_open_questions_full(limit=20)
+    return {"new_questions": count, "open_questions": len(oq)}
 
 @app.get("/api/curiosity/stats")
 async def curiosity_stats():
     return {"stats": curiosity.get_stats()}
+
+
+@app.get("/api/curiosity/queue")
+async def curiosity_queue(limit: int = 20):
+    items = store.db.list_open_questions_full(limit=limit)
+    return {"items": items, "count": len(items)}
 
 # --- Conflicts ---
 
@@ -1159,6 +1736,11 @@ async def autonomy_tick():
 @app.get("/api/metacognition/status")
 async def metacognition_status():
     return _metacognition_tick()
+
+
+@app.get("/api/self-awareness/status")
+async def self_awareness_status():
+    return _self_awareness_snapshot()
 
 
 # --- Memory Curation ---
@@ -1270,6 +1852,87 @@ async def execute_external_action(req: ActionExecRequest):
         return {"status": "executed", "kind": kind, "audit_hash": audit.get("audit_hash")}
 
     raise HTTPException(400, "Unsupported action kind")
+
+
+# --- Adaptabilidade: policy dinâmico + self-patch supervisionado ---
+
+@app.get("/api/policy/runtime")
+async def policy_runtime_get():
+    from ultronpro.policy import _load_runtime_rules
+    return {"rules": _load_runtime_rules()}
+
+
+@app.post("/api/policy/runtime")
+async def policy_runtime_set(rules: Dict[str, Any]):
+    from ultronpro.policy import RULES_PATH
+    RULES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RULES_PATH.write_text(json.dumps(rules or {}, ensure_ascii=False, indent=2))
+    store.db.add_event("policy_runtime_updated", "🧩 regras dinâmicas de policy atualizadas")
+    return {"status": "ok"}
+
+
+@app.post("/api/selfpatch/prepare")
+async def selfpatch_prepare(req: SelfPatchPrepareRequest):
+    fp = (req.file_path or "").strip()
+    if not _selfpatch_allowed(fp):
+        raise HTTPException(403, "file_path not allowed")
+    if not (req.reason or "").strip():
+        raise HTTPException(400, "reason required")
+
+    p = Path(fp)
+    if not p.exists():
+        raise HTTPException(404, "file not found")
+    txt = p.read_text()
+    if req.old_text not in txt:
+        raise HTTPException(400, "old_text not found")
+
+    token = secrets.token_urlsafe(18)
+    preview = txt.replace(req.old_text, req.new_text, 1)
+    _selfpatch_tokens[token] = {
+        "file_path": fp,
+        "old_text": req.old_text,
+        "new_text": req.new_text,
+        "reason": req.reason[:200],
+        "expires_at": time.time() + 300,
+        "diff_hash": hashlib.sha256((req.old_text + "->" + req.new_text).encode("utf-8")).hexdigest(),
+    }
+    store.db.add_event("selfpatch_prepared", f"🧪 selfpatch prepared for {fp}")
+    return {"status": "prepared", "token": token, "diff_hash": _selfpatch_tokens[token]["diff_hash"], "preview_chars": len(preview)}
+
+
+@app.post("/api/selfpatch/apply")
+async def selfpatch_apply(req: SelfPatchApplyRequest):
+    t = _selfpatch_tokens.get(req.token)
+    if not t:
+        raise HTTPException(400, "invalid token")
+    if float(t.get("expires_at") or 0) < time.time():
+        _selfpatch_tokens.pop(req.token, None)
+        raise HTTPException(400, "token expired")
+
+    p = Path(t["file_path"])
+    txt = p.read_text()
+    if t["old_text"] not in txt:
+        raise HTTPException(400, "old_text no longer present")
+
+    backup_dir = Path('/app/data/selfpatch_backups')
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup = str(backup_dir / f"{p.name}.{int(time.time())}.bak")
+    Path(backup).write_text(txt)
+
+    try:
+        p.write_text(txt.replace(t["old_text"], t["new_text"], 1))
+        store.db.add_event("selfpatch_applied", f"🛠️ selfpatch applied to {p.name}", meta_json=json.dumps({"diff_hash": t.get("diff_hash"), "reason": t.get("reason")}, ensure_ascii=False))
+        _selfpatch_tokens.pop(req.token, None)
+        return {"status": "applied", "file": str(p), "backup": backup}
+    except PermissionError:
+        # fallback: persist proposal for host-side/manual apply
+        pending_dir = Path('/app/data/selfpatch_pending')
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        pending_path = pending_dir / f"patch_{int(time.time())}_{p.name}.json"
+        pending_path.write_text(json.dumps(t, ensure_ascii=False, indent=2))
+        store.db.add_event("selfpatch_pending", f"🧩 selfpatch pending (sem permissão de escrita em {p.name})", meta_json=json.dumps({"pending": str(pending_path), "diff_hash": t.get("diff_hash")}, ensure_ascii=False))
+        _selfpatch_tokens.pop(req.token, None)
+        return {"status": "pending_manual", "file": str(p), "pending": str(pending_path), "backup": backup}
 
 
 # --- Etapa F: benchmark + replay ---
@@ -1443,6 +2106,84 @@ async def persistent_goals_delete(goal_id: str):
     _persistent_goals_save(data)
     store.db.add_event("persistent_goal_deleted", f"🗑️ meta persistente removida: {goal_id}")
     return {"status": "ok", "active_id": data.get("active_id")}
+
+
+@app.get("/api/procedures")
+async def procedures_list(limit: int = 50, domain: str = ""):
+    d = domain.strip() or None
+    return {"procedures": store.list_procedures(limit=limit, domain=d)}
+
+
+@app.post("/api/procedures/learn")
+async def procedures_learn(req: ProcedureLearnRequest):
+    p = _extract_procedure_from_text(req.observation_text, domain=req.domain, name_hint=req.name)
+    if not p:
+        raise HTTPException(400, "Could not extract procedure")
+
+    pid = store.add_procedure(
+        name=p['name'],
+        goal=p.get('goal'),
+        steps_json=json.dumps(p.get('steps') or [], ensure_ascii=False),
+        domain=p.get('domain'),
+        proc_type=p.get('proc_type') or 'analysis',
+        preconditions=p.get('preconditions'),
+        success_criteria=p.get('success_criteria'),
+    )
+    store.db.add_insight("procedure_learned", "Nova habilidade procedural", f"Aprendi procedimento: {p['name']} ({p.get('domain')}).", priority=4)
+    return {"status": "ok", "procedure_id": pid, "procedure": p}
+
+
+@app.post("/api/procedures/run-log")
+async def procedures_run_log(req: ProcedureRunRequest):
+    rid = store.add_procedure_run(
+        procedure_id=req.procedure_id,
+        input_text=req.input_text,
+        output_text=req.output_text,
+        score=float(req.score),
+        success=bool(req.success),
+        notes=req.notes,
+    )
+    return {"status": "ok", "run_id": rid}
+
+
+@app.post("/api/procedures/select")
+async def procedures_select(req: ProcedureSelectRequest):
+    sel = _select_procedure(req.context_text, domain=req.domain)
+    return {"selected": sel}
+
+
+@app.post("/api/procedures/execute")
+async def procedures_execute(procedure_id: int, input_text: str = ""):
+    return _execute_procedure_simulation(procedure_id, input_text=input_text)
+
+
+@app.post("/api/procedures/execute-active")
+async def procedures_execute_active(procedure_id: int, input_text: str = "", notify: bool = False):
+    return _execute_procedure_active(procedure_id, input_text=input_text, notify=notify)
+
+
+@app.post("/api/analogy/transfer")
+async def analogy_transfer(req: AnalogyTransferRequest):
+    return await _run_analogy_transfer(req.problem_text, target_domain=req.target_domain)
+
+
+@app.get("/api/analogies")
+async def analogies_list(limit: int = 50, status: str = "", target_domain: str = ""):
+    s = status.strip() or None
+    td = target_domain.strip() or None
+    return {"analogies": store.list_analogies(limit=limit, status=s, target_domain=td)}
+
+
+@app.post("/api/workspace/publish")
+async def workspace_publish(req: WorkspacePublishRequest):
+    wid = _workspace_publish(req.module, req.channel, req.payload or {}, salience=float(req.salience), ttl_sec=int(req.ttl_sec))
+    return {"status": "ok", "id": wid}
+
+
+@app.get("/api/workspace/read")
+async def workspace_read(limit: int = 30, channels: str = "", include_expired: bool = False):
+    chs = [c.strip() for c in channels.split(",") if c.strip()] if channels else None
+    return {"items": store.read_workspace(channels=chs, limit=limit, include_expired=include_expired)}
 
 
 @app.get("/api/goals")

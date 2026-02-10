@@ -402,16 +402,27 @@ def mark_question_success(question_id: int, triples_count: int):
     pass
 
 def mark_question_failure(question_id: int):
-    """Marca pergunta como falha."""
-    pass
+    """Marca pergunta como falha (baixa utilidade)."""
+    from ultronpro import store
+    q = store.db.get_question(int(question_id))
+    if not q:
+        return
+    get_processor().record_answer_feedback(
+        template_id=q.get("template_id"),
+        concept=q.get("concept"),
+        answer_length=0,
+        triples_extracted=0,
+    )
 
-def refresh_questions():
-    """Força geração de novas perguntas."""
+def refresh_questions(target_count: int = 5):
+    """Força geração de novas perguntas com alvo dinâmico (evita spam)."""
     from ultronpro import store
     # Gera perguntas baseadas em experiências recentes
     recent_exp = store.db.list_experiences(limit=30)
     open_q = store.db.list_open_questions(limit=200)
-    questions = get_processor().propose(recent_exp, open_q, target_count=5)
+    # se já houver muitas abertas, gera menos
+    effective_target = max(1, min(int(target_count), max(0, 8 - len(open_q)) or 1))
+    questions = get_processor().propose(recent_exp, open_q, target_count=effective_target)
     if questions:
         store.db.add_questions(questions)
     return len(questions)

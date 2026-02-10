@@ -63,6 +63,18 @@ Responda APENAS com a ação sugerida (uma frase imperativa)."""
                 )
             )
 
+            # transferência ativa por analogia quando conflito persiste
+            if seen >= 3:
+                q = f"{subj} {pred}"
+                actions.append(
+                    ProposedAction(
+                        kind='generate_analogy_hypothesis',
+                        text=f"(ação) Tentar analogia estrutural para resolver conflito: {subj} {pred}",
+                        priority=6,
+                        meta={"conflict_id": cid, "problem_text": q, "target_domain": str(pred)},
+                    )
+                )
+
     # 2) No conflicts? keep curiosity questions alive
     st = store.stats()
     if int(st.get('questions_open') or 0) < 3:

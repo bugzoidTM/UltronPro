@@ -11,37 +11,76 @@ def _get_lightrag_config():
     s = settings.load_settings()
     return s.get("lightrag_url"), s.get("lightrag_api_key")
 
+def _extract_context_any(data) -> str:
+    """Tolerante a mudanças de schema JSON."""
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    if isinstance(data, list):
+        return "\n".join([_extract_context_any(x) for x in data[:6] if _extract_context_any(x)])
+    if isinstance(data, dict):
+        # chaves comuns em variações de API
+        for k in ("context", "response", "result", "answer", "text", "content"):
+            v = data.get(k)
+            if v:
+                return _extract_context_any(v)
+        # fallback: serializa campos curtos
+        parts = []
+        for k, v in list(data.items())[:8]:
+            sv = _extract_context_any(v)
+            if sv:
+                parts.append(f"{k}: {sv}")
+        return "\n".join(parts)
+    return str(data)
+
+
 async def search_knowledge(query: str, top_k: int = 5) -> List[Dict]:
-    """Search LightRAG knowledge base via /query endpoint."""
+    """Search LightRAG knowledge base with adaptive endpoint/schema handling."""
     url, key = _get_lightrag_config()
     if not url or not key:
         logger.warning("LightRAG not configured. Skipping knowledge search.")
         return []
 
     base = url.rstrip("/")
+    payload = {
+        "query": query,
+        "mode": "mix",
+        "top_k": int(top_k),
+        "only_need_context": True,
+    }
+
+    endpoints = [f"{base}/query", f"{base}/query/data"]
+
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{base}/query",
-                headers={"X-API-Key": key},
-                json={
-                    "query": query,
-                    "mode": "mix",
-                    "top_k": int(top_k),
-                    "only_need_context": True,
-                },
-                timeout=20.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            last_err = None
+            for ep in endpoints:
+                try:
+                    resp = await client.post(
+                        ep,
+                        headers={"X-API-Key": key},
+                        json=payload,
+                        timeout=20.0,
+                    )
+                    if resp.status_code >= 400:
+                        last_err = f"{ep} -> {resp.status_code}"
+                        continue
 
-            # LightRAG usually returns context blob; adapt into list for UI
-            context = data.get("context") or data.get("response") or ""
-            if not context:
-                return []
+                    data = resp.json()
+                    context = _extract_context_any(data)
+                    if not context:
+                        continue
 
-            text = str(context)
-            return [{"text": text[:2500], "source_id": "lightrag", "score": 0.7, "type": "experience"}]
+                    text = str(context)
+                    return [{"text": text[:2500], "source_id": "lightrag", "score": 0.7, "type": "experience"}]
+                except Exception as e:
+                    last_err = str(e)
+                    continue
+
+            if last_err:
+                logger.error(f"LightRAG Search Error: {last_err}")
+            return []
 
     except Exception as e:
         logger.error(f"LightRAG Search Error: {e}")

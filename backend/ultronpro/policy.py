@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from pathlib import Path
+import json
 
 
 @dataclass
@@ -10,6 +12,21 @@ class PolicyVerdict:
     score: float  # -1..+1
     reasons: list[str]
     matched_norms: list[dict[str, Any]]
+
+
+RULES_PATH = Path('/app/data/policy_rules.json')
+
+
+def _load_runtime_rules() -> dict[str, Any]:
+    """Carrega regras dinâmicas para reduzir hard-code no policy gate."""
+    try:
+        if RULES_PATH.exists():
+            d = json.loads(RULES_PATH.read_text())
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
 
 
 def evaluate_action(text: str, norms: list[dict[str, Any]]) -> PolicyVerdict:
@@ -28,6 +45,8 @@ def evaluate_action(text: str, norms: list[dict[str, Any]]) -> PolicyVerdict:
     reasons: list[str] = []
     matched: list[dict[str, Any]] = []
 
+    runtime = _load_runtime_rules()
+
     # hard red flags (language-heuristic)
     hard_block_terms = [
         "matar",
@@ -42,6 +61,8 @@ def evaluate_action(text: str, norms: list[dict[str, Any]]) -> PolicyVerdict:
         "ameaçar",
         "coagir",
     ]
+    extra_block = runtime.get("hard_block_terms") if isinstance(runtime.get("hard_block_terms"), list) else []
+    hard_block_terms.extend([str(x).lower() for x in extra_block][:40])
     if any(x in tl for x in hard_block_terms):
         reasons.append("Red-flag: violência/ameaça explícita detectada")
 

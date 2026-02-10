@@ -609,7 +609,20 @@
           </div>
           <div class="card-body">
             <div id="gapsList" class="muted">(carregando...)</div>
+            <div style="margin-top:12px">
+              <button class="btn btn-sm btn-secondary" onclick="refreshQuestions()">➕ Gerar perguntas</button>
+            </div>
           </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 20px">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">📬</span> Fila Adaptativa de Perguntas</div>
+          <button class="btn btn-sm btn-secondary" onclick="loadCuriosityQueue()">🔄 Refresh</button>
+        </div>
+        <div class="card-body">
+          <div id="curQueueList"></div>
         </div>
       </div>
 
@@ -741,7 +754,7 @@
         // Load data for specific tabs
         if (tab.dataset.tab === 'graph') initGraph();
         if (tab.dataset.tab === 'sources') loadSources();
-        if (tab.dataset.tab === 'curiosity') loadCuriosityStats();
+        if (tab.dataset.tab === 'curiosity') { loadCuriosityStats(); loadCuriosityQueue(); }
         if (tab.dataset.tab === 'conflicts') loadConflicts();
         if (tab.dataset.tab === 'insights') loadInsights();
         if (tab.dataset.tab === 'settings') loadSettings();
@@ -809,6 +822,8 @@
           document.getElementById('questionText').textContent = currentQ.question;
           const meta = [];
           if (currentQ.priority) meta.push('priority=' + currentQ.priority);
+          if (currentQ.template_id) meta.push('template=' + currentQ.template_id);
+          if (currentQ.concept) meta.push('concept=' + currentQ.concept);
           if (currentQ.context) meta.push('contexto: ' + currentQ.context.slice(0, 100));
           document.getElementById('questionMeta').textContent = meta.join(' • ');
         } else {
@@ -822,9 +837,10 @@
 
     async function refreshQuestions() {
       try {
-        await api('/api/curiosity/refresh', { method: 'POST' });
-        showToast('✅ Perguntas atualizadas');
+        const r = await api('/api/curiosity/refresh?target_count=5', { method: 'POST' });
+        showToast(`✅ Perguntas atualizadas (+${r.new_questions || 0}, abertas=${r.open_questions || 0})`);
         await loadStatus();
+        await loadCuriosityQueue();
       } catch (e) {
         showToast('❌ ' + e.message, 'error');
       }
@@ -1065,6 +1081,30 @@
             </div>
           `;
         }).join('');
+      } catch (e) {
+        showToast('❌ ' + e.message, 'error');
+      }
+    }
+
+    async function loadCuriosityQueue() {
+      try {
+        const j = await api('/api/curiosity/queue?limit=20');
+        const items = j.items || [];
+        const el = document.getElementById('curQueueList');
+        if (!el) return;
+        if (!items.length) {
+          el.innerHTML = '<div class="muted">(fila vazia)</div>';
+          return;
+        }
+        el.innerHTML = items.map(q => `
+          <div class="list-item">
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
+              <strong>${escHtml(q.question || '')}</strong>
+              <span class="tag tag-blue">p=${q.priority || 0}</span>
+            </div>
+            <div class="muted" style="margin-top:6px;">template=${escHtml(q.template_id || '-')} • concept=${escHtml(q.concept || '-')}</div>
+          </div>
+        `).join('');
       } catch (e) {
         showToast('❌ ' + e.message, 'error');
       }
