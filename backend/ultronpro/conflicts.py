@@ -45,6 +45,6 @@ def archive(conflict_id: int):
     store.db.archive_conflict(int(conflict_id))
 
 
-async def auto_resolve_all(limit: int = 3) -> list[dict[str, Any]]:
+async def auto_resolve_all(limit: int = 3, force: bool = False) -> list[dict[str, Any]]:
     resolver = _get_resolver()
-    return resolver.resolve_pending(max_conflicts=max(1, int(limit)))
+    return resolver.resolve_pending(max_conflicts=max(1, int(limit)), force=bool(force))

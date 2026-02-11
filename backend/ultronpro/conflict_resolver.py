@@ -170,7 +170,15 @@ def analyze_conflict(
         )
         
         data = _parse_llm_response(response)
-        
+        if not data:
+            return ResolutionResult(
+                resolved=False,
+                confidence=0.0,
+                reasoning='LLM indisponível/sem JSON válido para análise de conflito.',
+                needs_human=True,
+                strategy='llm_unavailable',
+            )
+
         chosen = data.get("chosen", "").strip()
         confidence = float(data.get("confidence", 0))
         reasoning = data.get("reasoning", "")
@@ -232,6 +240,9 @@ def analyze_conflict(
         return ResolutionResult(
             resolved=False,
             error=f"Erro na análise LLM: {str(e)[:200]}",
+            needs_human=True,
+            strategy='llm_exception',
+            reasoning='Falha de análise automática; requer revisão humana ou fallback.',
         )
 
 
@@ -298,7 +309,7 @@ class ConflictResolver:
         """Busca triplas relacionadas ao sujeito do conflito."""
         return self.store.search_triples(subject, limit=limit)
     
-    def resolve_pending(self, max_conflicts: int = MAX_CONFLICTS_PER_CYCLE) -> list[dict]:
+    def resolve_pending(self, max_conflicts: int = MAX_CONFLICTS_PER_CYCLE, force: bool = False) -> list[dict]:
         """Tenta resolver conflitos pendentes.
         
         Returns:
@@ -314,8 +325,8 @@ class ConflictResolver:
             
             cid = int(c.get("id"))
             
-            # Verifica cooldown
-            if not self._can_attempt(cid):
+            # Verifica cooldown (ou força tentativa)
+            if (not force) and (not self._can_attempt(cid)):
                 continue
             
             # Busca detalhes completos

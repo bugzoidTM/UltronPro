@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-from ultronpro import llm, tom
+from ultronpro import llm, tom, mission_control, self_model
 
 
 @dataclass
@@ -54,6 +54,18 @@ def propose_actions(store) -> list[ProposedAction]:
             )
             actions.append(
                 ProposedAction(
+                    kind='execute_python_sandbox',
+                    text='(impulso-vida) Validar hipótese com código Python em sandbox (prova executável).',
+                    priority=9,
+                    meta={
+                        'goal_id': active_goal.get('id'),
+                        'code': "print('sandbox-check: python goal active')\nprint(sum(i*i for i in range(10)))",
+                        'timeout_sec': 10,
+                    },
+                )
+            )
+            actions.append(
+                ProposedAction(
                     kind='ask_evidence',
                     text='(impulso-vida) Pesquisar no LightRAG tópicos críticos de Python ligados ao objetivo ativo e sintetizar plano de estudo/execução.',
                     priority=8,
@@ -61,6 +73,19 @@ def propose_actions(store) -> list[ProposedAction]:
                 )
             )
         else:
+            if any(k in gtxt for k in ['otimizar', 'database', 'banco', 'sql', 'desempenho', 'performance']):
+                actions.append(
+                    ProposedAction(
+                        kind='execute_python_sandbox',
+                        text='(impulso-vida) Rodar script Python sandbox para medir hipótese técnica do objetivo.',
+                        priority=8,
+                        meta={
+                            'goal_id': active_goal.get('id'),
+                            'code': "import sqlite3, os\nprint('db-path', os.getenv('ULTRONPRO_DB_PATH','/app/data/ultron.db'))\nprint('probe-ok')",
+                            'timeout_sec': 12,
+                        },
+                    )
+                )
             actions.append(
                 ProposedAction(
                     kind='ask_evidence',
@@ -169,6 +194,35 @@ Responda APENAS com a ação sugerida (uma frase imperativa)."""
                 )
             )
 
+            # grounding: verificação headless sob demanda para reduzir alucinação em conflito persistente
+            if subj and pred and seen >= 2:
+                topic = str(subj).strip().replace(' ', '_')
+                actions.append(
+                    ProposedAction(
+                        kind='verify_source_headless',
+                        text=f"(ação) Verificar fonte canônica para conflito #{cid} via fetch headless.",
+                        priority=max(5, conflict_base_priority + 1),
+                        meta={
+                            'conflict_id': cid,
+                            'url': f'https://en.wikipedia.org/wiki/{topic}',
+                            'max_chars': 6000,
+                        },
+                    )
+                )
+                actions.append(
+                    ProposedAction(
+                        kind='ground_claim_check',
+                        text=f"(ação) Validar claim crítica do conflito #{cid} com grounding empírico (source+python/sql quando aplicável).",
+                        priority=max(5, conflict_base_priority + 1),
+                        meta={
+                            'conflict_id': cid,
+                            'claim': f"{subj} {pred}",
+                            'url': f'https://en.wikipedia.org/wiki/{topic}',
+                            'require_reliability': 0.55,
+                        },
+                    )
+                )
+
             # transferência ativa por analogia quando conflito persiste
             if seen >= 3:
                 q = f"{subj} {pred}"
@@ -206,6 +260,44 @@ Responda APENAS com a ação sugerida (uma frase imperativa)."""
                     priority=2,
                 )
             )
+    except Exception:
+        pass
+
+    # 4) Mission Control delegation awareness (Phase C)
+    try:
+        m_tasks = mission_control.list_tasks(limit=40)
+        hot = [t for t in m_tasks if str(t.get('status') or '') in ('assigned', 'in_progress', 'blocked')]
+        if hot:
+            top = hot[-1]
+            ttitle = str(top.get('title') or '')
+            tstatus = str(top.get('status') or '')
+            ass = ','.join(top.get('assignees') or [])
+            actions.append(
+                ProposedAction(
+                    kind='ask_evidence',
+                    text=f"(mission-control) Atualizar task '{ttitle}' [{tstatus}] com próximo passo e evidência objetiva (assignees={ass}).",
+                    priority=6,
+                    meta={'mission_task_id': top.get('id'), 'mission_status': tstatus, 'assignees': top.get('assignees') or []},
+                )
+            )
+    except Exception:
+        pass
+
+    # 5) Causal priors from self-model (M2)
+    try:
+        by_strategy = self_model.best_strategy_scores(limit=60)
+        for a in actions:
+            sr = by_strategy.get(str(a.kind), None)
+            if sr is None:
+                continue
+            if sr >= 0.72:
+                a.priority = int(a.priority or 0) + 2
+            elif sr >= 0.58:
+                a.priority = int(a.priority or 0) + 1
+            elif sr <= 0.32:
+                a.priority = int(a.priority or 0) - 2
+            elif sr <= 0.45:
+                a.priority = int(a.priority or 0) - 1
     except Exception:
         pass
 

@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
-from ultronpro import llm, knowledge_bridge, graph, settings, curiosity, conflicts, store, extract, planner, goals, autofeeder, policy, analogy, tom, semantics, unsupervised, neuroplastic, causal, intrinsic, emergence, itc, longhorizon, subgoals, neurosym, project_kernel, tool_router, project_executor, integrity, self_model, env_tools, persona
+from ultronpro import llm, knowledge_bridge, graph, settings, curiosity, conflicts, store, extract, planner, goals, autofeeder, policy, analogy, tom, semantics, unsupervised, neuroplastic, causal, intrinsic, emergence, itc, longhorizon, subgoals, neurosym, project_kernel, tool_router, project_executor, integrity, self_model, env_tools, persona, fs_audit, sql_explorer, source_probe, squad_phase_a, squad_phase_c, mission_control, homeostasis, contrafactual, grounding, identity_daily, governance, adaptive_control, economic, self_play
 from ultronpro.knowledge_bridge import search_knowledge, ingest_knowledge
 
 # Logging
@@ -1170,13 +1170,16 @@ def _refresh_goals_from_context() -> dict:
     return {"proposed": len(proposed_goals), "upserts": created, "ambitions": ambitions, "milestones_added": milestones_added, "active": active_goal}
 
 
-async def _run_judge_cycle(limit: int = 2, source: str = "loop") -> dict:
+async def _run_judge_cycle(limit: int = 2, source: str = "loop", force: bool = False) -> dict:
     """Integração real do Juiz: resolve conflitos em background sem clique humano."""
     open_conf = len(store.db.list_conflicts(status="open", limit=200))
     if open_conf <= 0:
         return {"open_conflicts": 0, "resolved": 0, "needs_human": 0, "attempted": 0}
 
-    results = await conflicts.auto_resolve_all(limit=max(1, int(limit)))
+    results = await conflicts.auto_resolve_all(limit=max(1, int(limit)), force=bool(force))
+    if (not force) and len(results) == 0 and open_conf > 0:
+        # fallback pass to avoid deadlock from cooldown-only starvation
+        results = await conflicts.auto_resolve_all(limit=max(1, int(limit)), force=True)
     resolved = 0
     needs_human = 0
     for it in results:
@@ -2265,6 +2268,52 @@ async def _execute_next_action() -> dict | None:
 
     store.db.mark_action(aid, "running", policy_allowed=True, policy_score=verdict.score)
 
+    t0 = time.time()
+
+    def _task_type_of(k: str, m: dict) -> str:
+        if m.get('task_type'):
+            return str(m.get('task_type'))
+        kk = str(k or '')
+        if kk in ('execute_python_sandbox', 'invent_procedure', 'execute_procedure_active'):
+            return 'coding'
+        if kk in ('verify_source_headless', 'absorb_lightrag_general', 'ask_evidence'):
+            return 'research'
+        if kk in ('auto_resolve_conflicts', 'clarify_semantics'):
+            return 'review'
+        if kk in ('deliberate_task',):
+            return 'critical'
+        return 'heartbeat'
+
+    task_type = _task_type_of(kind, meta)
+    cp = (meta or {}).get('cost_policy') or {}
+    if not cp:
+        pick = economic.pick_profile(task_type)
+        prof = str(pick.get('profile') or 'balanced')
+        if prof == 'cheap':
+            cp = {'model_hint': 'cheap', 'max_tokens': 500, 'thinking': 'low'}
+        elif prof == 'deep':
+            cp = {'model_hint': 'deep', 'max_tokens': 2200, 'thinking': 'high'}
+        else:
+            cp = {'model_hint': 'balanced', 'max_tokens': 1200, 'thinking': 'medium'}
+        meta['cost_policy'] = cp
+        meta['task_type'] = task_type
+        meta['economic_pick'] = pick
+
+    # Budget profiles (System-1 / Balanced / System-2)
+    prof_hint = str(cp.get('model_hint') or 'balanced')
+    if prof_hint == 'cheap':
+        meta.setdefault('budget_profile', 'cheap')
+        meta.setdefault('budget_seconds', 20)
+        meta.setdefault('max_steps', 3)
+    elif prof_hint == 'deep':
+        meta.setdefault('budget_profile', 'deep')
+        meta.setdefault('budget_seconds', 70)
+        meta.setdefault('max_steps', 7)
+    else:
+        meta.setdefault('budget_profile', 'balanced')
+        meta.setdefault('budget_seconds', 35)
+        meta.setdefault('max_steps', 5)
+
     try:
         dg = None
         dq = 0.5
@@ -2347,6 +2396,89 @@ async def _execute_next_action() -> dict | None:
             return {"id": aid, "status": "blocked", "kind": kind, "integrity_reason": reason_integrity}
         else:
             integrity.register_decision(kind, True, 'integrity_pass', {'action_id': aid, 'dq': dq, 'sym_score': sym_score})
+
+        # M4: Deliberação contrafactual obrigatória em ações críticas
+        if kind in contrafactual.CRITICAL_KINDS:
+            cdr = contrafactual.deliberate(kind, text, meta, require_min_score=0.30)
+            _neurosym_proof(
+                "critical_contrafactual",
+                premises=[f"kind={kind}", f"approved={cdr.get('approved')}", f"chosen={((cdr.get('chosen') or {}).get('id'))}", f"score={((cdr.get('chosen') or {}).get('score'))}"],
+                inference="Critical decision evaluated with alternative plans and explicit trade-offs.",
+                conclusion=f"Critical deliberation {'approved' if cdr.get('approved') else 'rejected'} for {kind}.",
+                confidence=0.7 if cdr.get('approved') else 0.45,
+                action_meta={"action_id": aid, "kind": kind, "status": "preflight_contrafactual"},
+            )
+            if not cdr.get('approved'):
+                store.db.mark_action(aid, "blocked", last_error="contrafactual_rejected")
+                store.db.add_event("blocked_contrafactual", f"⛔ ação crítica bloqueada #{aid}: {kind} (score insuficiente)")
+                return {"id": aid, "status": "blocked", "kind": kind, "reason": "contrafactual_rejected", "report_id": cdr.get('id')}
+
+        # M5 gate: ações críticas com claim/evidência exigem grounding mínimo
+        if kind in contrafactual.CRITICAL_KINDS and kind != 'ground_claim_check':
+            require_grounding = bool((meta or {}).get('require_grounding'))
+            has_ground_inputs = bool((meta or {}).get('claim') or (meta or {}).get('url') or (meta or {}).get('sql_query') or (meta or {}).get('python_code'))
+            if require_grounding or has_ground_inputs:
+                sql_res = None
+                py_res = None
+                src_res = None
+                if (meta or {}).get('sql_query'):
+                    try:
+                        sql_res = sql_explorer.execute_sql(str((meta or {}).get('sql_query')), limit=120)
+                    except Exception as e:
+                        sql_res = {'ok': False, 'error': str(e)[:180]}
+                if (meta or {}).get('python_code'):
+                    try:
+                        py_res = env_tools.run_python(code=str((meta or {}).get('python_code')), timeout_sec=12)
+                    except Exception as e:
+                        py_res = {'ok': False, 'error': str(e)[:180]}
+                if (meta or {}).get('url'):
+                    try:
+                        src_res = source_probe.fetch_clean_text(str((meta or {}).get('url')), max_chars=3500)
+                    except Exception as e:
+                        src_res = {'ok': False, 'error': str(e)[:180]}
+
+                checks_ok = sum([
+                    1 if bool((sql_res or {}).get('ok')) else 0,
+                    1 if bool((py_res or {}).get('ok')) else 0,
+                    1 if bool((src_res or {}).get('ok')) else 0,
+                ])
+                gitem = grounding.record_claim(
+                    claim=str((meta or {}).get('claim') or text or '')[:500],
+                    sql_result=sql_res,
+                    python_result=py_res,
+                    source_result=src_res,
+                    conclusion='Grounded' if checks_ok >= 2 else 'Insufficient grounding',
+                )
+                req_rel = float((meta or {}).get('require_reliability') or 0.55)
+                g_ok = float(gitem.get('reliability') or 0.0) >= req_rel
+                _neurosym_proof(
+                    "grounding_gate",
+                    premises=[f"kind={kind}", f"reliability={gitem.get('reliability')}", f"required={req_rel}"],
+                    inference="Empirical grounding gate validated claim evidence before critical execution.",
+                    conclusion=f"Grounding gate {'passed' if g_ok else 'failed'} for {kind}.",
+                    confidence=0.72 if g_ok else 0.42,
+                    action_meta={"action_id": aid, "kind": kind, "status": "grounding_pass" if g_ok else "blocked_grounding"},
+                )
+                if not g_ok:
+                    store.db.mark_action(aid, "blocked", last_error="grounding_insufficient")
+                    store.db.add_event("blocked_grounding", f"🧪⛔ ação crítica bloqueada #{aid}: grounding insuficiente ({gitem.get('reliability'):.2f}<{req_rel:.2f})")
+                    return {"id": aid, "status": "blocked", "kind": kind, "reason": "grounding_insufficient", "reliability": gitem.get('reliability')}
+
+        # M6 gate: governança por classe (auto / auto_with_proof / human_approval)
+        gov_has_proof = bool(has_proof or kind in contrafactual.CRITICAL_KINDS or (meta or {}).get('proof_ok'))
+        gv = governance.evaluate(kind, meta=meta, has_proof=gov_has_proof)
+        if not gv.get('ok'):
+            store.db.mark_action(aid, 'blocked', last_error=f"governance:{gv.get('reason')}")
+            store.db.add_event('blocked_governance', f"🧷 ação bloqueada por governança #{aid}: {kind} ({gv.get('reason')})")
+            _neurosym_proof(
+                'governance_block',
+                premises=[f"kind={kind}", f"class={gv.get('class')}", f"reason={gv.get('reason')}"] ,
+                inference='Governance matrix blocked action due to class constraint violation.',
+                conclusion=f"Action {kind} blocked by governance class gate.",
+                confidence=0.8,
+                action_meta={'action_id': aid, 'kind': kind, 'status': 'blocked_governance'},
+            )
+            return {'id': aid, 'status': 'blocked', 'kind': kind, 'reason': gv.get('reason'), 'class': gv.get('class')}
 
         if kind == "generate_questions":
             n = curiosity.generate_questions()
@@ -2471,8 +2603,16 @@ async def _execute_next_action() -> dict | None:
             ptxt = str((meta or {}).get("problem_text") or text or "")
             bsec = int((meta or {}).get("budget_seconds") or 35)
             msteps = int((meta or {}).get("max_steps") or 4)
+            # enforce profile tiers for inference-time compute
+            bp = str((meta or {}).get('budget_profile') or 'balanced')
+            if bp == 'cheap':
+                bsec = min(bsec, 25)
+                msteps = min(msteps, 3)
+            elif bp == 'deep':
+                bsec = max(bsec, 60)
+                msteps = max(msteps, 6)
             info = _run_deliberate_task(problem_text=ptxt, max_steps=msteps, budget_seconds=bsec)
-            store.db.add_event("action_done", f"🤖 ação #{aid}: deliberate_task steps={len(info.get('steps') or [])}")
+            store.db.add_event("action_done", f"🤖 ação #{aid}: deliberate_task profile={bp} steps={len(info.get('steps') or [])} budget={bsec}s")
         elif kind == "horizon_review":
             info = _horizon_review_tick()
             store.db.add_event("action_done", f"🤖 ação #{aid}: horizon_review status={info.get('status')}")
@@ -2507,7 +2647,83 @@ async def _execute_next_action() -> dict | None:
                 file_path=(meta or {}).get('file_path'),
                 timeout_sec=int((meta or {}).get('timeout_sec') or 15),
             )
+            _neurosym_proof(
+                'sandbox_execution',
+                premises=[f"kind=execute_python_sandbox", f"returncode={info.get('returncode')}", f"ok={info.get('ok')}"] ,
+                inference='Code was executed in isolated sandbox and produced observable output.',
+                conclusion=f"Sandbox execution {'succeeded' if info.get('ok') else 'failed'}.",
+                confidence=0.8 if info.get('ok') else 0.45,
+                action_meta={'action_id': aid, 'kind': 'execute_python_sandbox', 'status': 'done' if info.get('ok') else 'error'},
+            )
             store.db.add_event("action_done", f"🤖 ação #{aid}: execute_python_sandbox ok={info.get('ok')} rc={info.get('returncode')}")
+        elif kind == "verify_source_headless":
+            url = str((meta or {}).get('url') or '').strip()
+            if not url:
+                store.db.add_event("action_skipped", f"↷ ação #{aid}: verify_source_headless sem url")
+            else:
+                info = source_probe.fetch_clean_text(url, max_chars=int((meta or {}).get('max_chars') or 6000))
+                if info.get('ok'):
+                    txt = str(info.get('text') or '')
+                    ttl = str(info.get('title') or '')
+                    if len(txt) >= 120:
+                        sid = f"source_probe:{info.get('url')}"
+                        store.db.add_experience(None, f"{ttl}\n\n{txt}".strip()[:16000], source_id=sid, modality='text')
+                store.db.add_event("action_done", f"🤖 ação #{aid}: verify_source_headless ok={info.get('ok')} url={info.get('url')}")
+        elif kind == "ground_claim_check":
+            claim = str((meta or {}).get('claim') or text or '').strip()[:500]
+            gurl = str((meta or {}).get('url') or '').strip()
+            sql_q = (meta or {}).get('sql_query')
+            py_c = (meta or {}).get('python_code')
+            sql_res = None
+            py_res = None
+            src_res = None
+            if sql_q:
+                try:
+                    sql_res = sql_explorer.execute_sql(str(sql_q), limit=120)
+                except Exception as e:
+                    sql_res = {'ok': False, 'error': str(e)[:180]}
+            if py_c:
+                try:
+                    py_res = env_tools.run_python(code=str(py_c), timeout_sec=12)
+                except Exception as e:
+                    py_res = {'ok': False, 'error': str(e)[:180]}
+            if gurl:
+                src_res = source_probe.fetch_clean_text(gurl, max_chars=3500)
+            checks_ok = sum([1 if bool((sql_res or {}).get('ok')) else 0, 1 if bool((py_res or {}).get('ok')) else 0, 1 if bool((src_res or {}).get('ok')) else 0])
+            item = grounding.record_claim(
+                claim=claim,
+                sql_result=sql_res,
+                python_result=py_res,
+                source_result=src_res,
+                conclusion='Grounded' if checks_ok >= 2 else 'Insufficient grounding',
+            )
+            meta['_last_grounding_reliability'] = float(item.get('reliability') or 0.0)
+            store.db.add_event("action_done", f"🤖 ação #{aid}: ground_claim_check reliability={item.get('reliability')} claim={claim[:80]}")
+        elif kind == "symbolic_cleanup":
+            sym = neurosym.consistency_check(limit=300)
+            score = float(sym.get('consistency_score') or 1.0)
+            unresolved = len(store.db.list_conflicts(status='open', limit=30))
+            if score < 0.80 or unresolved > 5:
+                _run_synthesis_cycle(max_items=2)
+                store.db.prune_low_utility_experiences(limit=120, focus_terms=_goal_focus_terms())
+                store.db.add_event("symbolic_cleanup", f"🧹 limpeza neuro-simbólica aplicada: consistency={score:.2f} open_conflicts={unresolved}")
+            else:
+                store.db.add_event("symbolic_cleanup", f"✅ limpeza simbólica não necessária: consistency={score:.2f} open_conflicts={unresolved}")
+        elif kind == "self_play_simulation":
+            sz = int((meta or {}).get('size') or 12)
+            out = self_play.simulate_batch(size=sz)
+            for s in ((out.get('run') or {}).get('samples') or []):
+                rw = economic.reward(bool(s.get('ok')), int(s.get('latency_ms') or 0), reliability=float(s.get('reliability') or 0.0))
+                economic.update(str(s.get('task_type') or 'general'), str(s.get('profile') or 'balanced'), rw, bool(s.get('ok')), int(s.get('latency_ms') or 0))
+                self_model.record_action_outcome(
+                    strategy=f"synthetic_{s.get('task_type')}",
+                    task_type=str(s.get('task_type') or 'general'),
+                    budget_profile=str(s.get('profile') or 'balanced'),
+                    ok=bool(s.get('ok')),
+                    latency_ms=int(s.get('latency_ms') or 0),
+                    notes='self_play_synthetic',
+                )
+            store.db.add_event("action_done", f"🤖 ação #{aid}: self_play_simulation size={len(((out.get('run') or {}).get('samples') or []))}")
         else:
             store.db.add_event("action_skipped", f"↷ ação #{aid} desconhecida: {kind}")
 
@@ -2520,6 +2736,22 @@ async def _execute_next_action() -> dict | None:
             confidence=0.72,
             action_meta={"action_id": aid, "kind": kind, "status": "done"},
         )
+        try:
+            lat_ms = int((time.time() - t0) * 1000)
+            prof = str(cp.get('model_hint') or 'default')
+            self_model.record_action_outcome(
+                strategy=str(kind),
+                task_type=task_type,
+                budget_profile=prof,
+                ok=True,
+                latency_ms=lat_ms,
+                notes='action_done',
+            )
+            rel = (meta or {}).get('_last_grounding_reliability')
+            rw = economic.reward(True, lat_ms, reliability=rel)
+            economic.update(task_type, prof, rw, True, lat_ms)
+        except Exception:
+            pass
         return {"id": aid, "status": "done", "kind": kind}
     except Exception as e:
         store.db.mark_action(aid, "error", last_error=str(e)[:500])
@@ -2532,6 +2764,22 @@ async def _execute_next_action() -> dict | None:
             action_meta={"action_id": aid, "kind": kind, "status": "error"},
         )
         store.db.add_event("action_error", f"❌ ação #{aid} falhou: {str(e)[:120]}")
+        try:
+            lat_ms = int((time.time() - t0) * 1000)
+            prof = str(cp.get('model_hint') or 'default')
+            self_model.record_action_outcome(
+                strategy=str(kind),
+                task_type=task_type,
+                budget_profile=prof,
+                ok=False,
+                latency_ms=lat_ms,
+                notes=str(e)[:180],
+            )
+            rel = (meta or {}).get('_last_grounding_reliability')
+            rw = economic.reward(False, lat_ms, reliability=rel)
+            economic.update(task_type, prof, rw, False, lat_ms)
+        except Exception:
+            pass
         return {"id": aid, "status": "error", "kind": kind, "error": str(e)}
 
 
@@ -2560,6 +2808,120 @@ async def autonomy_loop():
             st = store.db.stats()
             open_conf = len(store.db.list_conflicts(status="open", limit=5))
 
+            # Homeostasis (M1): monitor vitals and adapt autonomy mode
+            meta_status = _metacognition_tick() or {}
+            actions_recent = store.db.list_actions(limit=120)
+            denom = max(1, len(actions_recent))
+            blocked_ratio = len([a for a in actions_recent if str(a.get('status') or '') == 'blocked']) / denom
+            error_ratio = len([a for a in actions_recent if str(a.get('status') or '') == 'error']) / denom
+            ad = adaptive_control.status()
+            hs = homeostasis.evaluate(
+                stats=st,
+                open_conflicts=open_conf,
+                decision_quality=float(meta_status.get('decision_quality') or 0.5),
+                queue_size=int(_autonomy_state.get('queued') or 0),
+                used_last_minute=int(_recent_actions_count(60)),
+                per_minute=int(AUTONOMY_BUDGET_PER_MIN),
+                active_goal=bool(store.get_active_goal()),
+                blocked_ratio=float(blocked_ratio),
+                error_ratio=float(error_ratio),
+                thresholds=(ad.get('thresholds') or {}),
+            )
+            hs_mode = str(hs.get('mode') or 'normal')
+            hs_op_mode = str(hs.get('operation_mode') or hs_mode)
+            if hs.get('mode_changed'):
+                store.db.add_event('homeostasis', f"🫀 mode change: {hs.get('previous_mode')} -> {hs_mode} | coherence={((hs.get('vitals') or {}).get('coherence_score'))}")
+
+            # periodic adaptive tuning (M1/M2 hardening)
+            try:
+                if int(time.time()) - int(ad.get('last_tune_at') or 0) >= 1800:
+                    causal_now = self_model.causal_summary(limit=80)
+                    tune = adaptive_control.tune_from_homeostasis(
+                        hs.get('history_tail') or [],
+                        blocked_ratio=float(blocked_ratio),
+                        strategy_diversity=len(causal_now.get('strategy_outcomes') or []),
+                    )
+                    if tune.get('changed'):
+                        store.db.add_event('adaptive', f"🎛️ tuning applied: thresholds={((tune.get('config') or {}).get('thresholds'))}")
+            except Exception as e:
+                logger.debug(f"Adaptive tuning skipped: {e}")
+
+            # Squad Phase A: staggered heartbeats for specialized agents
+            try:
+                for ag in squad_phase_a.due_heartbeats():
+                    aid = str(ag.get('id') or 'agent')
+                    role = str(ag.get('role') or 'Specialist')
+                    purpose = str(ag.get('purpose') or '')
+                    hb_policy = squad_phase_c.policy_for_task('heartbeat', critical=False)
+                    _enqueue_action_if_new(
+                        'ask_evidence',
+                        f"(heartbeat:{aid}) [{role}] Verifique tarefas abertas, eventos recentes e blockers; execute 1 passo concreto e registre resultado.",
+                        priority=5,
+                        meta={'agent_id': aid, 'agent_role': role, 'agent_purpose': purpose, 'heartbeat': True, 'cost_policy': hb_policy},
+                        ttl_sec=12 * 60,
+                    )
+
+                    pending = mission_control.list_notifications(agent_id=aid, delivered=False, limit=6)
+                    if pending:
+                        txt = " | ".join([str(n.get('text') or '')[:120] for n in pending])
+                        _enqueue_action_if_new(
+                            'ask_evidence',
+                            f"(mentions:{aid}) Você foi mencionado/notificado: {txt}",
+                            priority=6,
+                            meta={'agent_id': aid, 'mentions': True, 'notification_count': len(pending)},
+                            ttl_sec=10 * 60,
+                        )
+                        for n in pending:
+                            mission_control.mark_notification(str(n.get('id')), delivered=True)
+
+                    store.db.add_event('heartbeat', f"💓 {aid} ({role}) wake: check -> act-or-standby")
+
+                # auto-delegation for inbox tasks without assignee
+                try:
+                    inbox = mission_control.list_tasks(status='inbox', limit=25)
+                    for t in inbox:
+                        if t.get('assignees'):
+                            continue
+                        who = squad_phase_c.suggest_assignee(str(t.get('title') or ''), str(t.get('description') or ''))
+                        mission_control.update_task(str(t.get('id')), status='assigned', assignees=[who])
+                        mission_control.add_message(str(t.get('id')), 'coord', f'@{who} auto-delegated pela política da Fase C. Assuma e reporte progresso.')
+                        store.db.add_event('delegation', f"🧭 task {t.get('id')} delegada para {who}")
+                except Exception as de:
+                    logger.debug(f"Auto delegation skipped: {de}")
+
+                if squad_phase_a.due_daily_standup():
+                    _enqueue_action_if_new(
+                        'ask_evidence',
+                        '(standup) Gerar resumo diário: concluído, em progresso, bloqueado, precisa revisão, decisões-chave.',
+                        priority=6,
+                        meta={'standup': True, 'window_sec': 86400, 'cost_policy': squad_phase_c.policy_for_task('review')},
+                        ttl_sec=50 * 60,
+                    )
+                    store.db.add_event('standup', '📊 Daily standup acionado (janela 24h).')
+
+                # M3: identidade diária (promessas -> revisão -> ajuste de protocolo)
+                if identity_daily.due_daily_review(hour_local=23):
+                    recent_done = [str(e.get('text') or '') for e in store.db.list_events(since_id=0, limit=180) if str(e.get('kind') or '') == 'action_done']
+                    recent_err = [str(e.get('text') or '') for e in store.db.list_events(since_id=0, limit=180) if 'error' in str(e.get('kind') or '') or 'blocked' in str(e.get('kind') or '')]
+                    out_id = identity_daily.run_daily_review(
+                        completed_hints=recent_done[-20:],
+                        failed_hints=recent_err[-20:],
+                        protocol_update='Priorizar grounding e contrafactual em ações críticas; reduzir experimentação em modo repair.',
+                    )
+                    store.db.add_event('identity', f"🪞 identidade diária revisada checksum={((out_id.get('entry') or {}).get('checksum'))}")
+            except Exception as e:
+                logger.debug(f"Squad heartbeat skipped: {e}")
+
+            # auto-play em ociosidade para reduzir falsa correlação com poucos dados (M2 robustness)
+            if int(_autonomy_state.get('queued') or 0) <= 2 and hs_mode in ('normal', 'conservative'):
+                _enqueue_action_if_new(
+                    'self_play_simulation',
+                    '(self-play) Rodar simulações internas para enriquecer estatísticas causais/econômicas em ociosidade.',
+                    priority=3,
+                    meta={'size': 12, 'task_type': 'review'},
+                    ttl_sec=25 * 60,
+                )
+
             # mantém curiosidade viva
             if int(st.get("questions_open") or 0) < 3:
                 _enqueue_action_if_new(
@@ -2585,12 +2947,13 @@ async def autonomy_loop():
             )
 
             # aprendizado não-supervisionado profundo (indução latente + reestruturação)
-            _enqueue_action_if_new(
-                "unsupervised_discovery",
-                "(ação) Descobrir conceitos latentes e reestruturar conhecimento sem template fixo.",
-                priority=4,
-                ttl_sec=30 * 60,
-            )
+            if hs_mode == 'normal':
+                _enqueue_action_if_new(
+                    "unsupervised_discovery",
+                    "(ação) Descobrir conceitos latentes e reestruturar conhecimento sem template fixo.",
+                    priority=4,
+                    ttl_sec=30 * 60,
+                )
 
             # neuroplasticidade fase 1: avaliar propostas de mutação em shadow mode
             _enqueue_action_if_new(
@@ -2609,12 +2972,13 @@ async def autonomy_loop():
             )
 
             # emergência de políticas: dinâmica latente + sampler divergente
-            _enqueue_action_if_new(
-                "emergence_tick",
-                "(ação) Atualizar estado latente e amostrar políticas divergentes.",
-                priority=4,
-                ttl_sec=20 * 60,
-            )
+            if hs_mode != 'repair':
+                _enqueue_action_if_new(
+                    "emergence_tick",
+                    "(ação) Atualizar estado latente e amostrar políticas divergentes.",
+                    priority=4,
+                    ttl_sec=20 * 60,
+                )
 
             # System-2 router: agenda deliberação prolongada quando complexidade subir
             itc_need = _itc_router_need()
@@ -2625,6 +2989,22 @@ async def autonomy_loop():
                     priority=6,
                     meta={"problem_text": f"Conflitos abertos={itc_need.get('open_conflicts')}; dq={itc_need.get('decision_quality'):.2f}; resolver trade-offs e plano.", "budget_seconds": 45, "max_steps": 5},
                     ttl_sec=25 * 60,
+                )
+
+            # investigativo: quando incerteza alta com energia saudável, aumentar esforço deliberativo
+            if hs_op_mode == 'investigative':
+                _enqueue_action_if_new(
+                    "deliberate_task",
+                    "(ação-itc-investigative) Gerar hipóteses rivais e validar consistência lógica antes de agir.",
+                    priority=7,
+                    meta={
+                        "problem_text": "Uncertainty alta: gerar 3 hipóteses, comparar contradições e selecionar plano consistente.",
+                        "budget_seconds": 55,
+                        "max_steps": 6,
+                        "require_contrafactual": True,
+                        "task_type": "critical",
+                    },
+                    ttl_sec=20 * 60,
                 )
 
             # continuidade de longo horizonte (dias/semanas)
@@ -2649,12 +3029,13 @@ async def autonomy_loop():
                 ttl_sec=40 * 60,
             )
 
-            _enqueue_action_if_new(
-                "project_experiment_cycle",
-                "(ação-projeto) Rodar experimento técnico e validar hipótese de melhoria.",
-                priority=5,
-                ttl_sec=45 * 60,
-            )
+            if hs_mode == 'normal':
+                _enqueue_action_if_new(
+                    "project_experiment_cycle",
+                    "(ação-projeto) Rodar experimento técnico e validar hipótese de melhoria.",
+                    priority=5,
+                    ttl_sec=45 * 60,
+                )
 
             _enqueue_action_if_new(
                 "self_model_refresh",
@@ -2663,13 +3044,14 @@ async def autonomy_loop():
                 ttl_sec=60 * 60,
             )
 
-            _enqueue_action_if_new(
-                "absorb_lightrag_general",
-                "(ação-knowledge) Absorver conhecimento do LightRAG com profundidade (multi-domínio).",
-                priority=4,
-                meta={'max_topics': 18, 'doc_limit': 12, 'domains': 'python,systems,database,ai'},
-                ttl_sec=50 * 60,
-            )
+            if hs_mode != 'repair':
+                _enqueue_action_if_new(
+                    "absorb_lightrag_general",
+                    "(ação-knowledge) Absorver conhecimento do LightRAG com profundidade (multi-domínio).",
+                    priority=4,
+                    meta={'max_topics': 18 if hs_mode == 'normal' else 10, 'doc_limit': 12 if hs_mode == 'normal' else 8, 'domains': 'python,systems,database,ai'},
+                    ttl_sec=50 * 60,
+                )
 
             # Sprint 3: clarificação semântica ativa (ambiguidade/metáfora/ironia)
             try:
@@ -2695,6 +3077,27 @@ async def autonomy_loop():
                 ttl_sec=10 * 60,
             )
 
+            if hs_mode == 'repair':
+                _enqueue_action_if_new(
+                    'curate_memory',
+                    '(homeostasis-repair) Curadoria emergencial para reduzir inconsistência e ruído.',
+                    priority=7,
+                    ttl_sec=20 * 60,
+                )
+                _enqueue_action_if_new(
+                    'auto_resolve_conflicts',
+                    '(homeostasis-repair) Priorizar resolução de conflitos para restaurar coerência.',
+                    priority=7,
+                    ttl_sec=15 * 60,
+                )
+                _enqueue_action_if_new(
+                    'deliberate_task',
+                    '(homeostasis-repair) Deliberar plano de recuperação de coerência com menor risco.',
+                    priority=7,
+                    meta={'problem_text': 'Recuperar coerência interna reduzindo contradições e incerteza.', 'budget_seconds': 35, 'max_steps': 4},
+                    ttl_sec=20 * 60,
+                )
+
             # polling básico de conflitos + ciclo síntese
             if open_conf > 0:
                 _enqueue_action_if_new(
@@ -2702,6 +3105,35 @@ async def autonomy_loop():
                     "(ação) Tentar auto-resolver 1 conflito com evidências atuais.",
                     priority=4,
                 )
+
+                # M5 intensificado: quando stress de contradição sobe, grounding obrigatório de claim
+                if float((hs.get('vitals') or {}).get('contradiction_stress') or 0.0) > 0.60:
+                    cands = store.db.list_conflicts(status='open', limit=1)
+                    if cands:
+                        c0 = cands[0]
+                        subj = str(c0.get('subject') or '').strip()
+                        topic = subj.replace(' ', '_') if subj else 'Science'
+                        _enqueue_action_if_new(
+                            'ground_claim_check',
+                            f"(grounding-stress) Validar claim de conflito crítico: {subj} {c0.get('predicate')}",
+                            priority=7,
+                            meta={
+                                'claim': f"{subj} {c0.get('predicate')}",
+                                'url': f'https://en.wikipedia.org/wiki/{topic}',
+                                'require_reliability': 0.60,
+                                'require_grounding': True,
+                                'task_type': 'research',
+                            },
+                            ttl_sec=20 * 60,
+                        )
+
+                    _enqueue_action_if_new(
+                        'symbolic_cleanup',
+                        '(neuro-symbolic) Desambiguar conflitos persistentes e reduzir confiança de variantes inconsistentes.',
+                        priority=7,
+                        ttl_sec=20 * 60,
+                    )
+
                 _run_synthesis_cycle(max_items=1)
 
                 try:
@@ -2954,6 +3386,12 @@ async def startup_event():
     except Exception as e:
         logger.warning(f"Source backfill skipped: {e}")
 
+    # Bootstrap squad phase-A artifacts (roles + working memory files)
+    try:
+        squad_phase_a.bootstrap()
+    except Exception as e:
+        logger.warning(f"Squad phase-A bootstrap skipped: {e}")
+
     # Start background loops
     _autofeeder_task = asyncio.create_task(autofeeder_loop())
     _autonomy_task = asyncio.create_task(autonomy_loop())
@@ -3181,9 +3619,9 @@ async def get_conflict(id: int):
     return {"conflict": c}
 
 @app.post("/api/conflicts/auto-resolve")
-async def auto_resolve_conflicts():
+async def auto_resolve_conflicts(force: bool = False, limit: int = 3):
     """Use LLM to attempt auto-resolution of open conflicts."""
-    info = await _run_judge_cycle(limit=3, source="api")
+    info = await _run_judge_cycle(limit=limit, source="api", force=force)
     return info
 
 
@@ -3199,8 +3637,8 @@ async def judge_status():
 
 
 @app.post("/api/judge/run")
-async def judge_run(limit: int = 2):
-    return await _run_judge_cycle(limit=limit, source="manual")
+async def judge_run(limit: int = 2, force: bool = False):
+    return await _run_judge_cycle(limit=limit, source="manual", force=force)
 
 
 @app.post("/api/conflicts/synthesis/run")
@@ -3293,6 +3731,16 @@ async def self_model_status():
 @app.post('/api/self-model/refresh')
 async def self_model_refresh():
     return _self_model_refresh()
+
+
+@app.get('/api/self-model/causal')
+async def self_model_causal(limit: int = 12):
+    return self_model.causal_summary(limit=limit)
+
+
+@app.get('/api/self-model/strategy-scores')
+async def self_model_strategy_scores(limit: int = 60):
+    return {'ok': True, 'scores': self_model.best_strategy_scores(limit=limit)}
 
 
 @app.get('/api/persona/status')
@@ -3586,6 +4034,433 @@ async def sandbox_run_python(req: SandboxRunRequest):
 @app.get('/api/sandbox/history')
 async def sandbox_history(limit: int = 50):
     return env_tools.history(limit=limit)
+
+
+@app.get('/api/filesystem/audit')
+async def filesystem_audit(root: str = '/app/ultronpro', limit: int = 400):
+    return fs_audit.scan_tree(root=root, limit=limit)
+
+
+@app.post('/api/filesystem/refactor-suggestions')
+async def filesystem_refactor_suggestions(root: str = '/app/ultronpro', limit: int = 400):
+    a = fs_audit.scan_tree(root=root, limit=limit)
+    if not a.get('ok'):
+        return a
+    store.db.add_event('fs_audit', f"🧰 fs audit: root={root} py={a.get('python_files')} scanned={a.get('files_scanned')}")
+    return {'ok': True, 'suggestions': a.get('suggestions'), 'largest_python': a.get('largest_python')}
+
+
+@app.get('/api/sql/tables')
+async def sql_tables():
+    return sql_explorer.list_tables()
+
+
+@app.get('/api/sql/describe/{table_name}')
+async def sql_describe(table_name: str):
+    return sql_explorer.describe_table(table_name)
+
+
+class SqlQueryBody(BaseModel):
+    query: str
+    limit: int = 200
+
+
+class SourceVerifyBody(BaseModel):
+    url: str
+    max_chars: int = 8000
+    ingest: bool = True
+
+
+@app.post('/api/sql/query')
+async def sql_query(body: SqlQueryBody):
+    try:
+        out = sql_explorer.execute_sql(body.query, limit=body.limit)
+        store.db.add_event('sql_explorer', f"🔎 sql query ok rows={out.get('row_count')} limit={out.get('limit')}")
+        return out
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+
+
+@app.post('/api/source/verify')
+async def source_verify(body: SourceVerifyBody):
+    out = source_probe.fetch_clean_text(body.url, max_chars=body.max_chars)
+    if not out.get('ok'):
+        return out
+    text = str(out.get('text') or '')
+    title = str(out.get('title') or '')
+    if body.ingest and len(text) >= 120:
+        snippet = f"{title}\n\n{text}".strip()
+        sid = f"source_probe:{out.get('url')}"
+        try:
+            eid = store.db.add_experience(None, snippet[:16000], source_id=sid, modality='text')
+            out['ingested_experience_id'] = eid
+        except Exception:
+            pass
+    store.db.add_event('source_probe', f"🌐 verify_source url={out.get('url')} chars={out.get('text_chars')}")
+    return out
+
+
+@app.post('/api/squad/bootstrap-phase-a')
+async def squad_bootstrap_phase_a():
+    out = squad_phase_a.bootstrap()
+    store.db.add_event('squad', f"👥 squad phase-a bootstrap agents={len(out.get('agents') or [])}")
+    return out
+
+
+@app.get('/api/squad/status')
+async def squad_status():
+    return squad_phase_a.status()
+
+
+@app.get('/api/squad/standup')
+async def squad_standup(window_sec: int = 86400, limit_events: int = 600):
+    ev = store.db.list_events(since_id=0, limit=int(limit_events))
+    return squad_phase_a.standup_from_events(ev, window_sec=window_sec)
+
+
+class McTaskBody(BaseModel):
+    title: str
+    description: str = ''
+    assignees: list[str] = []
+    task_type: str = 'heartbeat'
+
+
+class McTaskPatchBody(BaseModel):
+    status: str | None = None
+    assignees: list[str] | None = None
+
+
+class McMessageBody(BaseModel):
+    from_agent: str
+    content: str
+
+
+class McSubscribeBody(BaseModel):
+    agent_id: str
+
+
+class McNotificationPatchBody(BaseModel):
+    delivered: bool = True
+
+
+@app.post('/api/mission/tasks')
+async def mc_create_task(body: McTaskBody):
+    assignees = body.assignees or []
+    if not assignees:
+        assignees = [squad_phase_c.suggest_assignee(body.title, body.description)]
+    out = mission_control.create_task(body.title, body.description, assignees, task_type=body.task_type)
+    store.db.add_event('mission_control', f"🗂️ task criada: {out.get('id')} {out.get('title')} -> {','.join(out.get('assignees') or [])}")
+    for a in (out.get('assignees') or [])[:3]:
+        identity_daily.add_promise(f"Entregar task {out.get('id')} ({out.get('title')}) assignee={a}", source='mission_control')
+    return out
+
+
+@app.get('/api/mission/tasks')
+async def mc_list_tasks(status: str | None = None, limit: int = 80):
+    return {'ok': True, 'tasks': mission_control.list_tasks(status=status, limit=limit)}
+
+
+@app.post('/api/mission/tasks/{task_id}/update')
+async def mc_update_task(task_id: str, body: McTaskPatchBody):
+    out = mission_control.update_task(task_id, status=body.status, assignees=body.assignees)
+    if not out:
+        return {'ok': False, 'error': 'task_not_found'}
+    return {'ok': True, 'task': out}
+
+
+@app.post('/api/mission/tasks/{task_id}/messages')
+async def mc_add_message(task_id: str, body: McMessageBody):
+    out = mission_control.add_message(task_id, body.from_agent, body.content)
+    store.db.add_event('mission_control', f"💬 {out.get('from_agent')} comentou em {task_id}")
+    return {'ok': True, 'message': out}
+
+
+@app.get('/api/mission/tasks/{task_id}/messages')
+async def mc_list_messages(task_id: str, limit: int = 60):
+    return {'ok': True, 'messages': mission_control.list_messages(task_id, limit=limit)}
+
+
+@app.post('/api/mission/tasks/{task_id}/subscribe')
+async def mc_subscribe(task_id: str, body: McSubscribeBody):
+    out = mission_control.subscribe(task_id, body.agent_id)
+    return {'ok': True, **out}
+
+
+@app.get('/api/mission/activities')
+async def mc_activities(limit: int = 120):
+    return {'ok': True, 'activities': mission_control.list_activities(limit=limit)}
+
+
+@app.get('/api/mission/notifications')
+async def mc_notifications(agent_id: str | None = None, delivered: bool | None = None, limit: int = 80):
+    return {'ok': True, 'notifications': mission_control.list_notifications(agent_id=agent_id, delivered=delivered, limit=limit)}
+
+
+@app.post('/api/mission/notifications/{notification_id}')
+async def mc_notification_patch(notification_id: str, body: McNotificationPatchBody):
+    ok = mission_control.mark_notification(notification_id, delivered=body.delivered)
+    return {'ok': ok}
+
+
+@app.get('/api/squad/cost-policy')
+async def squad_cost_policy(task_type: str = 'heartbeat', critical: bool = False):
+    return {'ok': True, 'policy': squad_phase_c.policy_for_task(task_type, critical=critical)}
+
+
+@app.get('/api/squad/metrics')
+async def squad_metrics(window_sec: int = 86400 * 7, limit_tasks: int = 300, limit_activities: int = 1000):
+    tasks = mission_control.list_tasks(limit=limit_tasks)
+    acts = mission_control.list_activities(limit=limit_activities)
+    return squad_phase_c.productivity_metrics(tasks, acts, window_sec=window_sec)
+
+
+@app.get('/api/homeostasis/status')
+async def homeostasis_status():
+    return homeostasis.status()
+
+
+@app.get('/api/deliberation/critical-report')
+async def deliberation_critical_report(limit: int = 40):
+    return contrafactual.latest(limit=limit)
+
+
+class CriticalDeliberationBody(BaseModel):
+    kind: str
+    text: str
+    meta: dict[str, Any] | None = None
+    require_min_score: float = 0.30
+
+
+class ClaimCheckBody(BaseModel):
+    claim: str
+    url: str | None = None
+    sql_query: str | None = None
+    python_code: str | None = None
+    require_reliability: float = 0.55
+
+
+class IdentityPromiseBody(BaseModel):
+    text: str
+    source: str = 'system'
+
+
+class IdentityReviewBody(BaseModel):
+    completed_hints: list[str] = []
+    failed_hints: list[str] = []
+    protocol_update: str = ''
+
+
+class GovernancePatchBody(BaseModel):
+    patch: dict[str, Any]
+
+
+@app.post('/api/deliberation/critical-check')
+async def deliberation_critical_check(body: CriticalDeliberationBody):
+    return contrafactual.deliberate(body.kind, body.text, body.meta, require_min_score=body.require_min_score)
+
+
+@app.get('/api/identity/status')
+async def identity_status(limit: int = 20):
+    return identity_daily.status(limit=limit)
+
+
+@app.get('/api/governance/matrix')
+async def governance_matrix():
+    return governance.matrix()
+
+
+@app.post('/api/governance/matrix')
+async def governance_matrix_patch(body: GovernancePatchBody):
+    out = governance.patch_matrix(body.patch or {})
+    store.db.add_event('governance', '🧷 governance matrix atualizada')
+    return out
+
+
+@app.get('/api/governance/compliance')
+async def governance_compliance(limit_actions: int = 300):
+    acts = store.db.list_actions(limit=limit_actions)
+    total_critical = 0
+    total_human_class = 0
+    blocked_by_governance = 0
+    for a in acts:
+        k = str(a.get('kind') or '')
+        cls = governance.classify(k)
+        if cls in ('auto_with_proof', 'human_approval'):
+            total_critical += 1
+        if cls == 'human_approval':
+            total_human_class += 1
+        err = str(a.get('last_error') or '')
+        if 'governance:' in err:
+            blocked_by_governance += 1
+    return {
+        'ok': True,
+        'window_actions': len(acts),
+        'critical_or_restricted': total_critical,
+        'human_approval_class': total_human_class,
+        'blocked_by_governance': blocked_by_governance,
+        'compliance_score': round(1.0 - (blocked_by_governance / max(1, total_critical)), 4),
+    }
+
+
+@app.get('/api/adaptive/status')
+async def adaptive_status():
+    return adaptive_control.status()
+
+
+@app.get('/api/economic/status')
+async def economic_status(limit: int = 40):
+    return economic.status(limit=limit)
+
+
+@app.get('/api/self-play/status')
+async def self_play_status(limit: int = 10):
+    return self_play.status(limit=limit)
+
+
+@app.post('/api/self-play/run')
+async def self_play_run(size: int = 12):
+    out = self_play.simulate_batch(size=size)
+    # feed synthetic experience into economic + causal model (low-risk internal training)
+    for s in ((out.get('run') or {}).get('samples') or []):
+        rw = economic.reward(bool(s.get('ok')), int(s.get('latency_ms') or 0), reliability=float(s.get('reliability') or 0.0))
+        economic.update(str(s.get('task_type') or 'general'), str(s.get('profile') or 'balanced'), rw, bool(s.get('ok')), int(s.get('latency_ms') or 0))
+        self_model.record_action_outcome(
+            strategy=f"synthetic_{s.get('task_type')}",
+            task_type=str(s.get('task_type') or 'general'),
+            budget_profile=str(s.get('profile') or 'balanced'),
+            ok=bool(s.get('ok')),
+            latency_ms=int(s.get('latency_ms') or 0),
+            notes='self_play_synthetic',
+        )
+    store.db.add_event('self_play', f"🎮 self-play run size={len(((out.get('run') or {}).get('samples') or []))}")
+    return out
+
+
+@app.post('/api/adaptive/tune')
+async def adaptive_tune():
+    hs = homeostasis.status()
+    hist = hs.get('history_tail') or []
+    acts = store.db.list_actions(limit=180)
+    denom = max(1, len(acts))
+    blocked_ratio = len([a for a in acts if str(a.get('status') or '') == 'blocked']) / denom
+    causal = self_model.causal_summary(limit=80)
+    strategy_diversity = len(causal.get('strategy_outcomes') or [])
+    out = adaptive_control.tune_from_homeostasis(hist, blocked_ratio=float(blocked_ratio), strategy_diversity=int(strategy_diversity))
+    if out.get('changed'):
+        store.db.add_event('adaptive', f"🎛️ adaptive tuning updated thresholds (diversity={strategy_diversity}, blocked={blocked_ratio:.2f})")
+    return out
+
+
+@app.get('/api/autonomy/weekly-report')
+async def autonomy_weekly_report(limit_actions: int = 600):
+    hs = homeostasis.status()
+    causal = self_model.causal_summary(limit=60)
+    gov = await governance_compliance(limit_actions=min(600, int(limit_actions)))
+    acts = store.db.list_actions(limit=min(600, int(limit_actions)))
+    done = len([a for a in acts if str(a.get('status') or '') == 'done'])
+    err = len([a for a in acts if str(a.get('status') or '') in ('error', 'blocked')])
+    return {
+        'ok': True,
+        'homeostasis': {
+            'mode': hs.get('mode'),
+            'vitals': hs.get('vitals'),
+        },
+        'self_model': {
+            'strategy_count': len(causal.get('strategy_outcomes') or []),
+            'task_count': len(causal.get('task_outcomes') or []),
+            'budget_count': len(causal.get('budget_profile_outcomes') or []),
+            'top_strategies': (causal.get('strategy_outcomes') or [])[:5],
+        },
+        'execution': {
+            'actions_window': len(acts),
+            'done': done,
+            'error_or_blocked': err,
+            'success_rate': round(done / max(1, (done + err)), 4),
+        },
+        'governance': gov,
+    }
+
+
+@app.post('/api/identity/promise')
+async def identity_promise(body: IdentityPromiseBody):
+    out = identity_daily.add_promise(body.text, source=body.source)
+    store.db.add_event('identity', f"🧾 promessa registrada: {out.get('text')}")
+    return {'ok': True, 'promise': out}
+
+
+@app.post('/api/identity/daily-review')
+async def identity_daily_review(body: IdentityReviewBody):
+    out = identity_daily.run_daily_review(body.completed_hints, body.failed_hints, body.protocol_update)
+    store.db.add_event('identity', f"🪞 daily-review checksum={((out.get('entry') or {}).get('checksum'))}")
+    return out
+
+
+@app.get('/api/grounding/claims')
+async def grounding_claims(limit: int = 40):
+    return grounding.latest(limit=limit)
+
+
+@app.post('/api/grounding/claim-check')
+async def grounding_claim_check(body: ClaimCheckBody):
+    sql_res = None
+    py_res = None
+    src_res = None
+
+    if (body.sql_query or '').strip():
+        try:
+            sql_res = sql_explorer.execute_sql(body.sql_query or '', limit=120)
+        except Exception as e:
+            sql_res = {'ok': False, 'error': str(e)[:220]}
+
+    if (body.python_code or '').strip():
+        try:
+            py_res = env_tools.run_python(code=body.python_code, timeout_sec=12)
+        except Exception as e:
+            py_res = {'ok': False, 'error': str(e)[:220]}
+
+    if (body.url or '').strip():
+        try:
+            src_res = source_probe.fetch_clean_text(body.url or '', max_chars=3500)
+        except Exception as e:
+            src_res = {'ok': False, 'error': str(e)[:220]}
+
+    checks_ok = sum([1 if bool((sql_res or {}).get('ok')) else 0, 1 if bool((py_res or {}).get('ok')) else 0, 1 if bool((src_res or {}).get('ok')) else 0])
+    item = grounding.record_claim(
+        claim=body.claim,
+        sql_result=sql_res,
+        python_result=py_res,
+        source_result=src_res,
+        conclusion='Grounded' if checks_ok >= 2 else 'Insufficient grounding',
+    )
+
+    ok = float(item.get('reliability') or 0.0) >= float(body.require_reliability or 0.55)
+    store.db.add_event('grounding', f"🧪 claim-check reliability={item.get('reliability')} ok={ok} claim={str(body.claim)[:120]}")
+    return {'ok': ok, 'require_reliability': body.require_reliability, 'item': item}
+
+
+@app.post('/api/homeostasis/tick')
+async def homeostasis_tick():
+    st = store.db.stats()
+    open_conf = len(store.db.list_conflicts(status='open', limit=20))
+    meta = _metacognition_tick() or {}
+    dq = float(meta.get('decision_quality') or 0.5)
+    actions_recent = store.db.list_actions(limit=120)
+    denom = max(1, len(actions_recent))
+    blocked_ratio = len([a for a in actions_recent if str(a.get('status') or '') == 'blocked']) / denom
+    error_ratio = len([a for a in actions_recent if str(a.get('status') or '') == 'error']) / denom
+    ad = adaptive_control.status()
+    return homeostasis.evaluate(
+        stats=st,
+        open_conflicts=open_conf,
+        decision_quality=dq,
+        queue_size=int(_autonomy_state.get('queued') or 0),
+        used_last_minute=int(_recent_actions_count(60)),
+        per_minute=int(AUTONOMY_BUDGET_PER_MIN),
+        active_goal=bool(store.get_active_goal()),
+        blocked_ratio=float(blocked_ratio),
+        error_ratio=float(error_ratio),
+        thresholds=(ad.get('thresholds') or {}),
+    )
 
 
 @app.post('/api/tool-router/plan')

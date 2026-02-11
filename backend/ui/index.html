@@ -482,6 +482,7 @@
           <div class="muted" id="reqScores" style="margin-top:8px">Requisitos 1-8: carregando...</div>
           <div class="muted" id="sprint2Health" style="margin-top:8px">Sprint 2: carregando...</div>
           <div id="conflictsPreview" class="muted" style="margin-top:10px">Conflitos: carregando...</div>
+          <div id="missionPreview" class="muted" style="margin-top:10px">Mission Control: carregando...</div>
         </div>
       </div>
 
@@ -944,6 +945,9 @@
           document.getElementById('questionText').textContent = '(nenhuma pergunta aberta)';
           document.getElementById('questionMeta').textContent = '';
         }
+
+        // keep conflicts counter/preview fresh even outside conflicts tab
+        loadConflictsSummary();
       } catch (e) {
         console.error('loadStatus error:', e);
       }
@@ -1291,8 +1295,12 @@
     // === Conflicts ===
     async function loadConflictsSummary() {
       try {
-        const j = await api('/api/conflicts?status=open&limit=5', { timeoutMs: 7000 });
+        const j = await api('/api/conflicts?status=open&limit=30', { timeoutMs: 7000 });
         const conflicts = j.conflicts || [];
+
+        const stat = document.getElementById('statConflicts');
+        if (stat) stat.textContent = conflicts.length;
+
         const el = document.getElementById('conflictsPreview');
         if (!el) return;
         if (!conflicts.length) {
@@ -1304,6 +1312,26 @@
       } catch (e) {
         const el = document.getElementById('conflictsPreview');
         if (el) el.innerHTML = `Conflitos: erro ao carregar (${escHtml(e.message)})`;
+      }
+    }
+
+    async function loadMissionPreview() {
+      try {
+        const [tasksRes, actRes] = await Promise.all([
+          api('/api/mission/tasks?limit=80', { timeoutMs: 7000 }),
+          api('/api/mission/activities?limit=40', { timeoutMs: 7000 }),
+        ]);
+        const tasks = tasksRes.tasks || [];
+        const act = actRes.activities || [];
+        const by = { inbox:0, assigned:0, in_progress:0, review:0, done:0, blocked:0 };
+        tasks.forEach(t => { const s = t.status || 'inbox'; if (by[s] !== undefined) by[s] += 1; });
+        const last = (act[act.length-1] || {}).text || 'sem atividade recente';
+        const el = document.getElementById('missionPreview');
+        if (!el) return;
+        el.innerHTML = `Mission Control — inbox:${by.inbox} • assigned:${by.assigned} • in_progress:${by.in_progress} • review:${by.review} • blocked:${by.blocked} • done:${by.done} | último: ${escHtml(String(last).slice(0,100))}`;
+      } catch (e) {
+        const el = document.getElementById('missionPreview');
+        if (el) el.innerHTML = `Mission Control: erro (${escHtml(e.message)})`;
       }
     }
 
@@ -1772,6 +1800,7 @@
     loadHorizonStatus();
     loadPersonaStatus();
     loadConflictsSummary();
+    loadMissionPreview();
     loadFeed();
     startEventStream();
 
@@ -1795,6 +1824,7 @@
       _timers.push(setInterval(loadHorizonStatus, slowIntervalMs));
       _timers.push(setInterval(loadPersonaStatus, slowIntervalMs));
       _timers.push(setInterval(loadConflictsSummary, slowIntervalMs));
+      _timers.push(setInterval(loadMissionPreview, slowIntervalMs));
     }
 
     function updatePollingMode() {
