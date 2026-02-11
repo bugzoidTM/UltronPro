@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
-from ultronpro import llm, knowledge_bridge, graph, settings, curiosity, conflicts, store, extract, planner, goals, autofeeder, policy, analogy, tom, semantics, unsupervised, neuroplastic, causal, intrinsic, emergence, itc, longhorizon, subgoals, neurosym
+from ultronpro import llm, knowledge_bridge, graph, settings, curiosity, conflicts, store, extract, planner, goals, autofeeder, policy, analogy, tom, semantics, unsupervised, neuroplastic, causal, intrinsic, emergence, itc, longhorizon, subgoals, neurosym, project_kernel, tool_router, project_executor, integrity
 from ultronpro.knowledge_bridge import search_knowledge, ingest_knowledge
 
 # Logging
@@ -120,8 +120,9 @@ class IntrinsicTickRequest(BaseModel):
 
 class ITCRunRequest(BaseModel):
     problem_text: str
-    max_steps: int = 4
-    budget_seconds: int = 35
+    max_steps: int = 0
+    budget_seconds: int = 0
+    use_rl: bool = True
 
 class HorizonMissionRequest(BaseModel):
     title: str
@@ -136,6 +137,25 @@ class HorizonCheckpointRequest(BaseModel):
 
 class SubgoalMarkRequest(BaseModel):
     status: str = "done"
+
+class ProjectRequest(BaseModel):
+    title: str
+    objective: str
+    scope: Optional[str] = None
+    sla_hours: int = 72
+
+class ProjectCheckpointRequest(BaseModel):
+    note: str
+    progress_delta: float = 0.0
+    signal: str = "tick"
+
+class ToolRouteRequest(BaseModel):
+    intent: str
+    context: Optional[Dict[str, Any]] = None
+    prefer_low_cost: bool = True
+
+class IntegrityRulesPatchRequest(BaseModel):
+    rules: Dict[str, Any]
 
 class PersistentGoalRequest(BaseModel):
     title: str
@@ -202,6 +222,9 @@ ACTION_COOLDOWNS_SEC = {
     "deliberate_task": 480,
     "horizon_review": 1800,
     "subgoal_planning": 1200,
+    "project_management_cycle": 1500,
+    "route_toolchain": 420,
+    "project_experiment_cycle": 1800,
 }
 
 # Etapa E: executor externo com segurança
@@ -602,20 +625,58 @@ def _itc_router_need() -> dict:
     return {'need': need, 'reason': reason, 'open_conflicts': open_conf, 'decision_quality': dq}
 
 
-def _run_deliberate_task(problem_text: str, max_steps: int = 4, budget_seconds: int = 35) -> dict:
-    out = itc.run_episode(problem_text=problem_text, max_steps=max_steps, budget_seconds=budget_seconds)
+def _run_deliberate_task(problem_text: str, max_steps: int = 0, budget_seconds: int = 0, use_rl: bool = True) -> dict:
+    out = itc.run_episode(problem_text=problem_text, max_steps=max_steps, budget_seconds=budget_seconds, use_rl=use_rl)
     chosen = out.get('chosen') or {}
     if chosen.get('test'):
         _enqueue_action_if_new(
             'ask_evidence',
             f"(itc-test) {chosen.get('test')}",
             priority=6,
-            meta={'source': 'itc', 'confidence': chosen.get('confidence')},
+            meta={'source': 'itc', 'confidence': chosen.get('confidence'), 'policy_arm': out.get('policy_arm')},
             ttl_sec=20 * 60,
         )
     _workspace_publish('itc', 'deliberation.episode', out, salience=0.82, ttl_sec=3600)
-    store.db.add_event('itc_episode', f"🧠 ITC steps={len(out.get('steps') or [])} quality={out.get('quality_proxy')}")
+    store.db.add_event('itc_episode', f"🧠 ITC arm={out.get('policy_arm')} steps={len(out.get('steps') or [])} quality={out.get('quality_proxy')} reward={out.get('reward')}")
     return out
+
+
+def _run_tool_route(intent: str, context: dict | None = None, prefer_low_cost: bool = True) -> dict:
+    plan = tool_router.plan_route(intent=intent, context=context or {}, prefer_low_cost=prefer_low_cost)
+    chain = list(plan.get('chain') or [])[:3]
+
+    attempted = []
+    for k in chain:
+        attempted.append(k)
+        try:
+            if k == 'ask_evidence':
+                q = str((context or {}).get('question') or f"(router:{intent}) executar próximo passo de recuperação")
+                store.db.add_questions([{"question": q[:500], "priority": 5, "context": "tool_router"}])
+                _neurosym_proof('tool_route', [f'intent={intent}', f'candidate={k}'], 'Selected low-cost evidence query route.', f'Route executed via {k}.', confidence=0.74, action_meta={'kind': k, 'status': 'done', 'intent': intent})
+                return {'status': 'ok', 'selected': k, 'attempted': attempted, 'plan': plan}
+            if k == 'deliberate_task':
+                ptxt = str((context or {}).get('problem_text') or f"Router intent {intent}: deliberate best next move")
+                out = _run_deliberate_task(problem_text=ptxt, max_steps=0, budget_seconds=0, use_rl=True)
+                if float(out.get('quality_proxy') or 0.0) >= 0.35:
+                    _neurosym_proof('tool_route', [f'intent={intent}', f'candidate={k}', f"quality={out.get('quality_proxy')}"], 'Selected deliberate route with acceptable quality.', f'Route executed via {k}.', confidence=0.78, action_meta={'kind': k, 'status': 'done', 'intent': intent})
+                    return {'status': 'ok', 'selected': k, 'attempted': attempted, 'plan': plan, 'result': out}
+                continue
+            if k == 'generate_analogy_hypothesis':
+                ptxt = str((context or {}).get('problem_text') or f"{intent} unresolved")
+                td = (context or {}).get('target_domain')
+                # schedule async path safely
+                _enqueue_action_if_new('generate_analogy_hypothesis', f"(router:{intent}) gerar hipótese analógica", priority=5, meta={'problem_text': ptxt[:300], 'target_domain': td, 'intent': intent}, ttl_sec=20 * 60)
+                _neurosym_proof('tool_route', [f'intent={intent}', f'candidate={k}'], 'Selected analogy route as fallback chain.', f'Route scheduled via {k}.', confidence=0.68, action_meta={'kind': k, 'status': 'scheduled', 'intent': intent})
+                return {'status': 'ok', 'selected': k, 'attempted': attempted, 'plan': plan, 'scheduled': True}
+            if k == 'maintain_question_queue':
+                info = _maintain_question_queue(stale_hours=18.0, max_fix=4)
+                _neurosym_proof('tool_route', [f'intent={intent}', f'candidate={k}'], 'Selected queue maintenance route for recovery.', f'Route executed via {k}.', confidence=0.64, action_meta={'kind': k, 'status': 'done', 'intent': intent})
+                return {'status': 'ok', 'selected': k, 'attempted': attempted, 'plan': plan, 'result': info}
+        except Exception:
+            continue
+
+    _neurosym_proof('tool_route', [f'intent={intent}', f'attempted={attempted}'], 'All route candidates failed or were unavailable.', 'Tool routing failed; no executable candidate.', confidence=0.3, action_meta={'kind': 'route_toolchain', 'status': 'error', 'intent': intent})
+    return {'status': 'error', 'attempted': attempted, 'plan': plan}
 
 
 def _subgoal_planning_tick() -> dict:
@@ -643,6 +704,150 @@ def _subgoal_planning_tick() -> dict:
     _workspace_publish("subgoals", "goal.subgoals", root, salience=0.8, ttl_sec=3600)
     store.db.add_event("subgoal_planning", f"🧩 subgoals root={root.get('id')} open={len(open_nodes)}")
     return {"status": "ok", "root": root, "open_nodes": len(open_nodes)}
+
+
+def _project_management_tick() -> dict:
+    project_kernel.ensure_default_playbooks()
+    p = project_kernel.active_project()
+
+    if not p:
+        # seed a project from active mission/goal
+        m = longhorizon.active_mission()
+        g = store.db.get_active_goal()
+        if m:
+            p = project_kernel.upsert_project(m.get('title') or 'Projeto', m.get('objective') or m.get('title') or 'Objetivo', scope=m.get('context'), sla_hours=72)
+        elif g:
+            p = project_kernel.upsert_project(g.get('title') or 'Projeto', g.get('description') or g.get('title') or 'Objetivo', scope='Seed from active goal', sla_hours=72)
+        else:
+            return {'status': 'no_project_context'}
+
+    # KPIs proxy
+    acts = store.db.list_actions(limit=160)
+    done = len([a for a in acts if a.get('status') == 'done'])
+    blocked = len([a for a in acts if a.get('status') == 'blocked'])
+    errs = len([a for a in acts if a.get('status') == 'error'])
+
+    progress_delta = max(-0.04, min(0.07, (done * 0.0018) - (blocked * 0.0025) - (errs * 0.002)))
+    cp = project_kernel.add_checkpoint(
+        p.get('id'),
+        note=f"tick done={done} blocked={blocked} errors={errs}",
+        progress_delta=progress_delta,
+        signal='project_tick',
+    )
+
+    blocked_hours = float((p.get('kpi') or {}).get('blocked_hours') or 0.0)
+    if blocked > 0:
+        blocked_hours += 0.5
+
+    stuck = int((p.get('kpi') or {}).get('stuck_cycles') or 0)
+    if progress_delta <= 0:
+        stuck += 1
+    else:
+        stuck = max(0, stuck - 1)
+
+    project_kernel.update_kpi(p.get('id'), {
+        'advance_week': float(p.get('progress') or 0.0),
+        'blocked_hours': blocked_hours,
+        'cost_score': float(errs + blocked) / max(1.0, float(done + 1)),
+        'stuck_cycles': stuck,
+    })
+
+    # playbook triggers
+    triggered = []
+    if errs >= 2:
+        triggered.append('tool_failure')
+    if blocked >= 3:
+        triggered.append('conflict_stalemate')
+    if stuck >= 2:
+        triggered.append('kpi_regression')
+
+    suggested = []
+    for sig in triggered[:2]:
+        acts_pb = project_kernel.suggest_playbook_actions(sig)
+        for ap in acts_pb[:2]:
+            suggested.append(f"{sig}:{ap}")
+            _enqueue_action_if_new(
+                'route_toolchain',
+                f"(recovery:{sig}) Roteador de ferramenta para fallback: {ap}",
+                priority=6,
+                meta={
+                    'project_id': p.get('id'),
+                    'playbook_signal': sig,
+                    'fallback': ap,
+                    'intent': sig,
+                    'prefer_low_cost': True,
+                    'context': {'problem_text': f"project={p.get('id')} signal={sig} fallback={ap}", 'target_domain': 'recovery'},
+                },
+                ttl_sec=25 * 60,
+            )
+
+    project_kernel.remember(
+        p.get('id'),
+        kind='tick',
+        text=f"tick done={done} blocked={blocked} errors={errs} delta={progress_delta:+.3f}",
+        meta={'triggered': triggered, 'suggested': suggested},
+    )
+    brief = project_kernel.project_brief(p.get('id'))
+
+    _workspace_publish('project_kernel', 'project.status', {
+        'project': p,
+        'checkpoint': cp,
+        'triggered': triggered,
+        'suggested': suggested,
+        'brief': brief,
+    }, salience=0.84 if triggered else 0.62, ttl_sec=3600)
+
+    # cadência de gestão: sempre agenda próximos 3 passos do brief
+    for step in (brief or {}).get('next_steps', [])[:3]:
+        _enqueue_action_if_new(
+            'ask_evidence',
+            f"(project-next) {step}",
+            priority=5,
+            meta={'project_id': p.get('id'), 'source': 'project_brief'},
+            ttl_sec=25 * 60,
+        )
+
+    store.db.add_event('project_management_tick', f"📦 project={p.get('id')} progressΔ={progress_delta:+.3f} triggers={','.join(triggered) if triggered else 'none'}")
+    return {'status': 'ok', 'project': project_kernel.active_project(), 'triggered': triggered, 'suggested': suggested, 'brief': brief}
+
+
+def _project_experiment_cycle() -> dict:
+    p = project_kernel.active_project()
+    if not p:
+        return {'status': 'no_active_project'}
+
+    brief = project_kernel.project_brief(p.get('id')) or {}
+    exp = project_executor.propose_experiment(p, brief=brief)
+    res = project_executor.run_experiment(exp)
+    rec = project_executor.record(exp, res)
+
+    project_kernel.remember(
+        p.get('id'),
+        kind='experiment',
+        text=f"exp={exp.get('id')} status={res.get('status')} success={res.get('success')}",
+        meta={'metrics': (res.get('metrics') or {}), 'artifact': res.get('artifact')},
+    )
+
+    # if experiment indicates optimization still needed, route mitigation chain
+    if res.get('status') == 'needs_optimization':
+        _enqueue_action_if_new(
+            'route_toolchain',
+            '(project-experiment) otimização necessária, executar rota de remediação.',
+            priority=6,
+            meta={
+                'intent': 'tool_failure',
+                'prefer_low_cost': True,
+                'context': {
+                    'problem_text': f"Projeto {p.get('id')} benchmark p95={((res.get('metrics') or {}).get('p95_read_ms'))}",
+                    'target_domain': 'database_optimization',
+                },
+            },
+            ttl_sec=30 * 60,
+        )
+
+    _workspace_publish('project_kernel', 'project.experiment', {'project_id': p.get('id'), 'experiment': rec}, salience=0.82, ttl_sec=3600)
+    store.db.add_event('project_experiment_cycle', f"🧪 project={p.get('id')} exp={exp.get('id')} status={res.get('status')}")
+    return {'status': 'ok', 'project_id': p.get('id'), 'experiment': rec}
 
 
 def _horizon_review_tick() -> dict:
@@ -1781,13 +1986,50 @@ async def _execute_next_action() -> dict | None:
     store.db.mark_action(aid, "running", policy_allowed=True, policy_score=verdict.score)
 
     try:
+        dg = None
+        dq = 0.5
+        cp = None
+        causal_checked = False
+
+        # guard deliberativo (System-2) antes de ações de maior impacto
+        if kind in ("execute_procedure_active", "prune_memory", "invent_procedure"):
+            dg = _run_deliberate_task(
+                problem_text=f"Preflight para ação {kind}: {text[:220]}",
+                max_steps=0,
+                budget_seconds=0,
+                use_rl=True,
+            )
+            dq = float(dg.get("quality_proxy") or 0.0)
+            _neurosym_proof(
+                "deliberative_preflight",
+                premises=[f"kind={kind}", f"quality_proxy={dq:.2f}"],
+                inference="System-2 preflight estimated action quality before execution.",
+                conclusion=f"Preflight for {kind} quality={dq:.2f}",
+                confidence=max(0.2, dq),
+                action_meta={"action_id": aid, "kind": kind, "status": "preflight"},
+            )
+            if dq < 0.38:
+                store.db.mark_action(aid, "blocked", last_error=f"deliberation_low_quality {dq:.2f}")
+                integrity.register_decision(kind, False, 'deliberation_low_quality', {'action_id': aid, 'dq': dq})
+                _neurosym_proof(
+                    "deliberative_block",
+                    premises=[f"kind={kind}", f"quality_proxy={dq:.2f}"],
+                    inference="Deliberative preflight failed minimum quality threshold.",
+                    conclusion=f"Action {kind} blocked pending better deliberation.",
+                    confidence=max(0.3, dq),
+                    action_meta={"action_id": aid, "kind": kind, "status": "blocked_deliberative"},
+                )
+                return {"id": aid, "status": "blocked", "kind": kind, "deliberation": dg}
+
         # precheck causal para ações potencialmente sensíveis
-        if kind in ("execute_procedure_active", "auto_resolve_conflicts", "prune_memory"):
+        if kind in ("execute_procedure_active", "auto_resolve_conflicts", "prune_memory", "invent_procedure"):
             cp = _causal_precheck(kind, text=text, meta=meta)
+            causal_checked = True
             risk = float((cp.get("simulation") or {}).get("risk_score") or 0.0)
             net = float((cp.get("simulation") or {}).get("net_score") or 0.0)
             if risk >= 1.2 and net < 0:
                 store.db.mark_action(aid, "blocked", last_error=f"causal_risk_high risk={risk} net={net}")
+                integrity.register_decision(kind, False, 'causal_guardrail_block', {'action_id': aid, 'risk': risk, 'net': net})
                 _neurosym_proof(
                     "causal_block",
                     premises=[f"kind={kind}", f"risk={risk:.2f}", f"net={net:.2f}"],
@@ -1798,6 +2040,33 @@ async def _execute_next_action() -> dict | None:
                 )
                 store.db.add_event("action_blocked", f"⛔ ação bloqueada por precheck causal #{aid}: {kind} (risk={risk:.2f}, net={net:.2f})")
                 return {"id": aid, "status": "blocked", "kind": kind, "causal": cp}
+
+        # dual-consensus integrity gate (neural + symbolic)
+        sym = neurosym.consistency_check(limit=200)
+        sym_score = float(sym.get('consistency_score') or 1.0)
+        has_proof = dg is not None if kind in ("execute_procedure_active", "prune_memory", "invent_procedure") else True
+        ok_integrity, reason_integrity = integrity.evaluate(
+            kind=kind,
+            neural_confidence=float(dq),
+            symbolic_consistency=sym_score,
+            has_proof=bool(has_proof),
+            causal_checked=bool(causal_checked or kind not in (integrity.load_rules().get('require_causal_precheck') or [])),
+        )
+        if not ok_integrity:
+            store.db.mark_action(aid, "blocked", last_error=f"integrity_veto:{reason_integrity}")
+            integrity.register_decision(kind, False, reason_integrity, {'action_id': aid, 'dq': dq, 'sym_score': sym_score})
+            store.db.add_event("blocked_integrity", f"🛡️ ação bloqueada por integrity gate #{aid}: {kind} ({reason_integrity})")
+            _neurosym_proof(
+                "integrity_block",
+                premises=[f"kind={kind}", f"dq={dq:.2f}", f"symbolic_consistency={sym_score:.2f}", f"reason={reason_integrity}"],
+                inference="Dual-consensus gate denied action due to integrity rule violation.",
+                conclusion=f"Action {kind} blocked by integrity gate.",
+                confidence=max(0.6, sym_score),
+                action_meta={"action_id": aid, "kind": kind, "status": "blocked_integrity"},
+            )
+            return {"id": aid, "status": "blocked", "kind": kind, "integrity_reason": reason_integrity}
+        else:
+            integrity.register_decision(kind, True, 'integrity_pass', {'action_id': aid, 'dq': dq, 'sym_score': sym_score})
 
         if kind == "generate_questions":
             n = curiosity.generate_questions()
@@ -1930,6 +2199,18 @@ async def _execute_next_action() -> dict | None:
         elif kind == "subgoal_planning":
             info = _subgoal_planning_tick()
             store.db.add_event("action_done", f"🤖 ação #{aid}: subgoal_planning status={info.get('status')}")
+        elif kind == "project_management_cycle":
+            info = _project_management_tick()
+            store.db.add_event("action_done", f"🤖 ação #{aid}: project_management_cycle status={info.get('status')}")
+        elif kind == "route_toolchain":
+            intent = str((meta or {}).get('intent') or 'general')
+            ctx = (meta or {}).get('context') or {}
+            plc = bool((meta or {}).get('prefer_low_cost', True))
+            info = _run_tool_route(intent=intent, context=ctx, prefer_low_cost=plc)
+            store.db.add_event("action_done", f"🤖 ação #{aid}: route_toolchain status={info.get('status')} selected={info.get('selected')}")
+        elif kind == "project_experiment_cycle":
+            info = _project_experiment_cycle()
+            store.db.add_event("action_done", f"🤖 ação #{aid}: project_experiment_cycle status={info.get('status')}")
         else:
             store.db.add_event("action_skipped", f"↷ ação #{aid} desconhecida: {kind}")
 
@@ -2062,6 +2343,20 @@ async def autonomy_loop():
                 "(ação-subgoal) Decompor objetivo atual em DAG de sub-objetivos.",
                 priority=4,
                 ttl_sec=35 * 60,
+            )
+
+            _enqueue_action_if_new(
+                "project_management_cycle",
+                "(ação-projeto) Rodar ciclo de gestão de projeto + recuperação de falhas.",
+                priority=5,
+                ttl_sec=40 * 60,
+            )
+
+            _enqueue_action_if_new(
+                "project_experiment_cycle",
+                "(ação-projeto) Rodar experimento técnico e validar hipótese de melhoria.",
+                priority=5,
+                ttl_sec=45 * 60,
             )
 
             # Sprint 3: clarificação semântica ativa (ambiguidade/metáfora/ironia)
@@ -2781,7 +3076,7 @@ async def emergence_indistinguishability(limit: int = 40):
 
 @app.post("/api/itc/run")
 async def itc_run(req: ITCRunRequest):
-    return _run_deliberate_task(req.problem_text, max_steps=req.max_steps, budget_seconds=req.budget_seconds)
+    return _run_deliberate_task(req.problem_text, max_steps=req.max_steps, budget_seconds=req.budget_seconds, use_rl=bool(req.use_rl))
 
 
 @app.get("/api/itc/history")
@@ -2795,7 +3090,13 @@ async def itc_status():
     h = itc.history(limit=30)
     avg_q = (sum(float(x.get('quality_proxy') or 0.0) for x in h) / max(1, len(h))) if h else 0.0
     avg_t = (sum(float(x.get('elapsed_sec') or 0.0) for x in h) / max(1, len(h))) if h else 0.0
-    return {"router": r, "episodes": len(h), "avg_quality_proxy": round(avg_q, 3), "avg_elapsed_sec": round(avg_t, 3)}
+    avg_r = (sum(float(x.get('reward') or 0.0) for x in h) / max(1, len(h))) if h else 0.0
+    return {"router": r, "episodes": len(h), "avg_quality_proxy": round(avg_q, 3), "avg_elapsed_sec": round(avg_t, 3), "avg_reward": round(avg_r, 3), "policy": itc.policy_status()}
+
+
+@app.get("/api/itc/policy")
+async def itc_policy():
+    return itc.policy_status()
 
 
 # --- Long Horizon Memory / Continuity ---
@@ -2841,6 +3142,70 @@ async def subgoals_mark(root_id: str, node_id: str, req: SubgoalMarkRequest):
     if not ok:
         raise HTTPException(404, "node not found")
     return {"status": "ok"}
+
+
+@app.post('/api/projects')
+async def projects_create(req: ProjectRequest):
+    p = project_kernel.upsert_project(req.title, req.objective, scope=req.scope, sla_hours=req.sla_hours)
+    store.db.add_event('project_upsert', f"📦 projeto ativo: {p.get('id')} {p.get('title')}")
+    return p
+
+
+@app.get('/api/projects')
+async def projects_list(limit: int = 30):
+    return {'active': project_kernel.active_project(), 'items': project_kernel.list_projects(limit=limit)}
+
+
+@app.post('/api/projects/{project_id}/checkpoint')
+async def projects_checkpoint(project_id: str, req: ProjectCheckpointRequest):
+    cp = project_kernel.add_checkpoint(project_id, req.note, progress_delta=req.progress_delta, signal=req.signal)
+    if not cp:
+        raise HTTPException(404, 'project not found')
+    project_kernel.remember(project_id, kind=req.signal or 'checkpoint', text=req.note, meta={'progress_delta': req.progress_delta})
+    return {'status': 'ok', 'checkpoint': cp}
+
+
+@app.get('/api/projects/playbooks')
+async def projects_playbooks():
+    return project_kernel.get_playbooks()
+
+
+@app.post('/api/projects/tick')
+async def projects_tick():
+    return _project_management_tick()
+
+
+@app.get('/api/projects/{project_id}/brief')
+async def projects_brief(project_id: str):
+    b = project_kernel.project_brief(project_id)
+    if not b:
+        raise HTTPException(404, 'project not found')
+    return b
+
+
+@app.get('/api/projects/{project_id}/memory')
+async def projects_memory(project_id: str, query: str = '', limit: int = 30):
+    return {'items': project_kernel.recall(project_id, query=query, limit=limit)}
+
+
+@app.get('/api/projects/{project_id}/experiments')
+async def projects_experiments(project_id: str, limit: int = 30):
+    return {'items': project_executor.list_experiments(project_id=project_id, limit=limit)}
+
+
+@app.post('/api/projects/experiments/run')
+async def projects_experiment_run():
+    return _project_experiment_cycle()
+
+
+@app.post('/api/tool-router/plan')
+async def tool_router_plan(req: ToolRouteRequest):
+    return tool_router.plan_route(req.intent, context=req.context or {}, prefer_low_cost=bool(req.prefer_low_cost))
+
+
+@app.post('/api/tool-router/run')
+async def tool_router_run(req: ToolRouteRequest):
+    return _run_tool_route(req.intent, context=req.context or {}, prefer_low_cost=bool(req.prefer_low_cost))
 
 
 # --- Neuroplasticidade Fase 1 (safe mutate loop) ---
@@ -3516,6 +3881,23 @@ async def neurosym_fidelity(limit: int = 120):
 @app.post("/api/neurosym/check")
 async def neurosym_check(limit: int = 200):
     return {"consistency": neurosym.consistency_check(limit=limit), "fidelity": neurosym.explanation_fidelity(limit=min(120, limit))}
+
+
+@app.get('/api/integrity/status')
+async def integrity_status():
+    return integrity.status()
+
+
+@app.post('/api/integrity/rules')
+async def integrity_rules_patch(req: IntegrityRulesPatchRequest):
+    integrity.save_rules(req.rules or {})
+    return integrity.status()
+
+
+@app.post('/api/integrity/evaluate')
+async def integrity_evaluate(kind: str, neural_confidence: float = 0.5, symbolic_consistency: float = 1.0, has_proof: bool = True, causal_checked: bool = True):
+    ok, reason = integrity.evaluate(kind, neural_confidence=neural_confidence, symbolic_consistency=symbolic_consistency, has_proof=has_proof, causal_checked=causal_checked)
+    return {'allowed': ok, 'reason': reason}
 
 
 @app.post("/api/workspace/publish")
