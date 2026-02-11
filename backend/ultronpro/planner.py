@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-from ultronpro import llm
+from ultronpro import llm, tom
 
 
 @dataclass
@@ -20,6 +20,49 @@ def propose_actions(store) -> list[ProposedAction]:
     2. LLM: "Improvise" strategies for stubborn conflicts.
     """
     actions: list[ProposedAction] = []
+
+    # Teoria da Mente (empatia cognitiva): inferir intenção do humano
+    recent_exp = store.list_experiences(limit=20)
+    intent = tom.infer_user_intent(recent_exp)
+    ilabel = intent.get('label')
+    iconf = float(intent.get('confidence') or 0.0)
+
+    if ilabel == 'confused':
+        actions.append(
+            ProposedAction(
+                kind='ask_evidence',
+                text='(ação-TOM) Reformular explicação em passos simples e verificar entendimento do humano com uma pergunta de checagem.',
+                priority=7,
+                meta={'tom_intent': ilabel, 'tom_confidence': iconf},
+            )
+        )
+    elif ilabel == 'testing':
+        actions.append(
+            ProposedAction(
+                kind='ask_evidence',
+                text='(ação-TOM) Fornecer resposta auditável com critérios de validação (o que funciona, limite e como testar).',
+                priority=7,
+                meta={'tom_intent': ilabel, 'tom_confidence': iconf},
+            )
+        )
+    elif ilabel == 'urgent':
+        actions.append(
+            ProposedAction(
+                kind='auto_resolve_conflicts',
+                text='(ação-TOM) Priorizar resolução rápida do bloqueio principal antes de exploração ampla.',
+                priority=8,
+                meta={'tom_intent': ilabel, 'tom_confidence': iconf},
+            )
+        )
+    else:  # exploratory
+        actions.append(
+            ProposedAction(
+                kind='generate_analogy_hypothesis',
+                text='(ação-TOM) Expandir entendimento com analogia estrutural de domínio adjacente.',
+                priority=5,
+                meta={'tom_intent': ilabel, 'tom_confidence': iconf, 'problem_text': 'exploração de contexto atual', 'target_domain': 'general'},
+            )
+        )
 
     # 1) Conflicts: keep collecting evidence / clarification
     # We fetch a few open conflicts

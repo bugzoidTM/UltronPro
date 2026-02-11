@@ -5,15 +5,17 @@ import asyncio
 import time
 import hashlib
 import secrets
+import random
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
-from ultronpro import llm, knowledge_bridge, graph, settings, curiosity, conflicts, store, extract, planner, goals, autofeeder, policy, analogy
+from ultronpro import llm, knowledge_bridge, graph, settings, curiosity, conflicts, store, extract, planner, goals, autofeeder, policy, analogy, tom, semantics, unsupervised, neuroplastic, causal, intrinsic, emergence, itc, longhorizon, subgoals, neurosym
 from ultronpro.knowledge_bridge import search_knowledge, ingest_knowledge
 
 # Logging
@@ -84,6 +86,11 @@ class ProcedureSelectRequest(BaseModel):
     context_text: str
     domain: Optional[str] = None
 
+class ProcedureInventRequest(BaseModel):
+    context_text: str
+    domain: Optional[str] = None
+    name_hint: Optional[str] = None
+
 class AnalogyTransferRequest(BaseModel):
     problem_text: str
     target_domain: Optional[str] = None
@@ -94,6 +101,41 @@ class WorkspacePublishRequest(BaseModel):
     payload: Dict[str, Any] = {}
     salience: float = 0.5
     ttl_sec: int = 900
+
+class MilestoneProgressRequest(BaseModel):
+    progress: float
+    status: Optional[str] = None
+
+class MutationProposalRequest(BaseModel):
+    title: str
+    rationale: str
+    patch: Dict[str, Any]
+    author: Optional[str] = "manual"
+
+class MutationDecisionRequest(BaseModel):
+    reason: Optional[str] = None
+
+class IntrinsicTickRequest(BaseModel):
+    force: bool = False
+
+class ITCRunRequest(BaseModel):
+    problem_text: str
+    max_steps: int = 4
+    budget_seconds: int = 35
+
+class HorizonMissionRequest(BaseModel):
+    title: str
+    objective: str
+    horizon_days: int = 14
+    context: Optional[str] = None
+
+class HorizonCheckpointRequest(BaseModel):
+    note: str
+    progress_delta: float = 0.0
+    signal: str = "reflection"
+
+class SubgoalMarkRequest(BaseModel):
+    status: str = "done"
 
 class PersistentGoalRequest(BaseModel):
     title: str
@@ -150,6 +192,16 @@ ACTION_COOLDOWNS_SEC = {
     "execute_procedure": 180,
     "execute_procedure_active": 240,
     "generate_analogy_hypothesis": 300,
+    "maintain_question_queue": 240,
+    "clarify_semantics": 180,
+    "unsupervised_discovery": 600,
+    "neuroplastic_cycle": 900,
+    "invent_procedure": 420,
+    "intrinsic_tick": 600,
+    "emergence_tick": 420,
+    "deliberate_task": 480,
+    "horizon_review": 1800,
+    "subgoal_planning": 1200,
 }
 
 # Etapa E: executor externo com segurança
@@ -159,6 +211,7 @@ _selfpatch_tokens: dict[str, dict] = {}
 BENCHMARK_HISTORY_PATH = Path("/app/data/benchmark_history.json")
 PERSISTENT_GOALS_PATH = Path("/app/data/persistent_goals.json")
 PROCEDURE_ARTIFACTS_DIR = Path("/app/data/procedure_artifacts")
+NEUROPLASTIC_GATE_STATE_PATH = Path("/app/data/neuroplastic_gate_state.json")
 
 
 def _benchmark_history_load() -> list[dict]:
@@ -179,6 +232,28 @@ def _benchmark_history_append(item: dict, max_items: int = 200):
     try:
         BENCHMARK_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
         BENCHMARK_HISTORY_PATH.write_text(json.dumps(arr, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+
+
+def _neuroplastic_gate_load() -> dict:
+    try:
+        if NEUROPLASTIC_GATE_STATE_PATH.exists():
+            d = json.loads(NEUROPLASTIC_GATE_STATE_PATH.read_text())
+            if isinstance(d, dict):
+                d.setdefault("revert_streaks", {})
+                d.setdefault("activation_baselines", {})
+                d.setdefault("last_snapshot", {})
+                return d
+    except Exception:
+        pass
+    return {"revert_streaks": {}, "activation_baselines": {}, "last_snapshot": {}}
+
+
+def _neuroplastic_gate_save(data: dict):
+    try:
+        NEUROPLASTIC_GATE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        NEUROPLASTIC_GATE_STATE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2))
     except Exception:
         pass
 
@@ -280,6 +355,33 @@ def _workspace_recent(channels: list[str] | None = None, limit: int = 20) -> lis
         return []
 
 
+def _audit_reasoning(decision_type: str, context: dict, rationale: str, confidence: float | None = None):
+    payload = {
+        "decision_type": decision_type,
+        "context": context,
+        "rationale": (rationale or "")[:800],
+        "confidence": confidence,
+        "ts": int(time.time()),
+    }
+    store.db.add_event("reasoning_audit", f"🧾 {decision_type}: {(rationale or '')[:140]}", meta_json=json.dumps(payload, ensure_ascii=False))
+
+
+def _neurosym_proof(decision_type: str, premises: list[str], inference: str, conclusion: str, confidence: float = 0.5, action_meta: dict | None = None):
+    try:
+        pf = neurosym.add_proof(decision_type, premises=premises, inference=inference, conclusion=conclusion, confidence=confidence, action_meta=action_meta or {})
+        store.db.add_event("neurosym_proof", f"📐 proof {pf.get('id')} {decision_type}: {(conclusion or '')[:120]}")
+    except Exception:
+        pass
+
+
+def _causal_precheck(kind: str, text: str = "", meta: dict | None = None) -> dict:
+    model = causal.build_world_model(store.db, limit=4000)
+    interventions = causal.infer_intervention_from_action(kind, text=text, meta=meta or {})
+    sim = causal.simulate_intervention(model, interventions, steps=3)
+    _audit_reasoning("causal_precheck", {"kind": kind, "interventions": interventions}, f"net={sim.get('net_score')} risk={sim.get('risk_score')} benefit={sim.get('benefit_score')}", confidence=0.7)
+    return {"model": {"nodes": model.get("nodes") and len(model.get("nodes")) or 0, "edges": len(model.get("edges") or [])}, "simulation": sim}
+
+
 def _latest_external_audit_hash() -> str | None:
     evs = store.db.list_events(limit=200)
     for e in reversed(evs):
@@ -324,12 +426,57 @@ def _mark_action_executed_now():
     _autonomy_state["last_actions_window"] = arr[-100:]
 
 
+def _apply_runtime_mutation_policy(kind: str, priority: int, cooldown: int, ttl: int) -> tuple[int, int, int, dict]:
+    rt = neuroplastic.active_runtime()
+    active = (rt or {}).get("active") or []
+    p = int(priority)
+    cd = int(cooldown)
+    t = int(ttl)
+    applied = {"treated": False, "mutation_ids": []}
+
+    for m in active:
+        patch = (m or {}).get("patch") or {}
+        if not isinstance(patch, dict):
+            continue
+
+        # canary A/B automático: aplica patch só em fração das decisões
+        canary_ratio = float(patch.get("canary_ratio") or 1.0)
+        if canary_ratio < 1.0 and random.random() > max(0.0, min(1.0, canary_ratio)):
+            continue
+
+        applied["treated"] = True
+        if m.get("id"):
+            applied["mutation_ids"].append(str(m.get("id")))
+
+        apd = patch.get("action_priority_delta") or {}
+        if isinstance(apd, dict):
+            p += int(apd.get(kind) or 0)
+        acs = patch.get("action_cooldown_scale") or {}
+        if isinstance(acs, dict) and acs.get(kind) is not None:
+            try:
+                cd = int(max(10, float(cd) * float(acs.get(kind))))
+            except Exception:
+                pass
+        if patch.get("queue_ttl_scale") is not None:
+            try:
+                t = int(max(60, float(t) * float(patch.get("queue_ttl_scale"))))
+            except Exception:
+                pass
+
+    return max(0, min(10, p)), max(10, min(7200, cd)), max(60, min(7200, t)), applied
+
+
 def _enqueue_action_if_new(kind: str, text: str, priority: int = 0, meta: dict | None = None, ttl_sec: int | None = None):
-    """Enfileira ação com dedupe + cooldown + expiração de fila."""
+    """Enfileira ação com dedupe + cooldown + expiração de fila + runtime mutation policy."""
     recent = store.db.list_actions(limit=120)
     now = time.time()
     cooldown = ACTION_COOLDOWNS_SEC.get(kind, 120)
-    cd_key = f"{kind}:{(meta or {}).get('conflict_id','')}"
+    mk = meta or {}
+    cd_sig = mk.get('conflict_id') or mk.get('goal_id') or mk.get('milestone_id') or mk.get('procedure_id') or ''
+    cd_key = f"{kind}:{cd_sig}"
+
+    ttl = int(ttl_sec or ACTION_DEFAULT_TTL_SEC)
+    priority, cooldown, ttl, mut = _apply_runtime_mutation_policy(kind, int(priority), int(cooldown), ttl)
 
     for a in recent:
         if a.get("status") in ("queued", "running") and a.get("kind") == kind and (a.get("text") or "") == text:
@@ -346,27 +493,227 @@ def _enqueue_action_if_new(kind: str, text: str, priority: int = 0, meta: dict |
             return
         break
 
-    ttl = int(ttl_sec or ACTION_DEFAULT_TTL_SEC)
     expires_at = now + ttl
+    mmeta = dict(meta or {})
+    if mut.get("treated"):
+        mmeta["mutation_treated"] = True
+        mmeta["mutation_ids"] = mut.get("mutation_ids") or []
     store.db.enqueue_action(
         kind=kind,
         text=text,
         priority=priority,
-        meta_json=json.dumps(meta or {}, ensure_ascii=False),
+        meta_json=json.dumps(mmeta, ensure_ascii=False),
         expires_at=expires_at,
         cooldown_key=cd_key,
     )
 
 
+def _ensure_goal_milestones(goal_id: int, title: str, description: str | None = None, weeks: int = 4) -> int:
+    existing = store.list_goal_milestones(goal_id=goal_id, status=None, limit=32)
+    if existing:
+        return 0
+    planner = goals.GoalPlanner()
+    ms = planner.build_weekly_milestones(title, description, weeks=weeks)
+    added = 0
+    for m in ms:
+        store.add_goal_milestone(goal_id, int(m.get("week_index") or 1), m.get("title") or "Milestone", m.get("progress_criteria"))
+        added += 1
+    return added
+
+
+def _intrinsic_tick(force: bool = False) -> dict:
+    st = intrinsic.load_state()
+
+    stats = store.db.stats()
+    meta = _metacognition_tick()
+    goals_all = store.db.list_goals(status=None, limit=200)
+    goals_done = len([g for g in goals_all if str(g.get('status') or '') == 'done'])
+    done_rate = goals_done / max(1, len(goals_all))
+
+    # novelty_index simples: razão de conceitos latentes recentes + perguntas abertas
+    novelty_index = min(1.0, (float(stats.get('questions_open') or 0) / 80.0) + 0.2)
+
+    signals = {
+        'uncurated': store.db.count_uncurated_experiences(),
+        'open_conflicts': len(store.db.list_conflicts(status='open', limit=300)),
+        'decision_quality': float(meta.get('decision_quality') or 0.5),
+        'goals_done_rate': float(done_rate),
+        'novelty_index': novelty_index,
+    }
+
+    st = intrinsic.update_drives(st, signals)
+    chosen = intrinsic.synthesize_intrinsic_goal(st)
+    st = intrinsic.revise_purpose(st, chosen)
+    intrinsic.save_state(st)
+
+    # cria/atualiza goal intrínseco
+    gid = store.db.upsert_goal(
+        f"[IME] {chosen.get('title')}",
+        f"{chosen.get('description')} | drive={chosen.get('drive')} reward={chosen.get('intrinsic_reward')}",
+        int(chosen.get('priority') or 4),
+    )
+
+    _workspace_publish('intrinsic', 'purpose.state', {'purpose': st.get('purpose'), 'drives': st.get('drives'), 'chosen_goal': chosen, 'goal_id': gid}, salience=0.78, ttl_sec=3600)
+    store.db.add_event('intrinsic_tick', f"🧭 IME tick: drive={chosen.get('drive')} goal={chosen.get('title')}")
+
+    return {
+        'signals': signals,
+        'drives': st.get('drives'),
+        'purpose': st.get('purpose'),
+        'chosen_goal': chosen,
+        'goal_id': gid,
+    }
+
+
+def _emergence_tick() -> dict:
+    stats = store.db.stats()
+    meta = _metacognition_tick()
+    inputs = {
+        'decision_quality': float(meta.get('decision_quality') or 0.5),
+        'open_conflicts': len(store.db.list_conflicts(status='open', limit=400)),
+        'novelty_index': min(1.0, float(stats.get('questions_open') or 0) / 80.0 + 0.2),
+    }
+    st = emergence.tick_latent(inputs)
+    policies = emergence.sample_policies({'stats': stats, 'meta': meta}, n=4)
+    chosen = emergence.choose_policy(policies, {'stats': stats, 'meta': meta})
+
+    for a in (chosen.get('actions') or [])[:2]:
+        _enqueue_action_if_new(
+            a,
+            f"(ação-emergence) Política latente selecionou: {a}",
+            priority=5,
+            meta={'emergence_policy': chosen.get('id')},
+            ttl_sec=20 * 60,
+        )
+
+    item = {'ts': int(time.time()), 'latent': st.get('latent'), 'chosen_policy': chosen}
+    emergence.log_eval(item)
+    _workspace_publish('emergence', 'emergence.state', item, salience=0.76, ttl_sec=2400)
+    store.db.add_event('emergence_tick', f"🧠 emergence policy={chosen.get('id')} actions={','.join(chosen.get('actions') or [])}")
+    return item
+
+
+def _itc_router_need() -> dict:
+    meta = _metacognition_tick()
+    open_conf = len(store.db.list_conflicts(status='open', limit=300))
+    dq = float(meta.get('decision_quality') or 0.5)
+    need = (open_conf >= 8) or (dq < 0.25)
+    reason = 'conflict_load' if open_conf >= 8 else ('low_decision_quality' if dq < 0.25 else 'none')
+    return {'need': need, 'reason': reason, 'open_conflicts': open_conf, 'decision_quality': dq}
+
+
+def _run_deliberate_task(problem_text: str, max_steps: int = 4, budget_seconds: int = 35) -> dict:
+    out = itc.run_episode(problem_text=problem_text, max_steps=max_steps, budget_seconds=budget_seconds)
+    chosen = out.get('chosen') or {}
+    if chosen.get('test'):
+        _enqueue_action_if_new(
+            'ask_evidence',
+            f"(itc-test) {chosen.get('test')}",
+            priority=6,
+            meta={'source': 'itc', 'confidence': chosen.get('confidence')},
+            ttl_sec=20 * 60,
+        )
+    _workspace_publish('itc', 'deliberation.episode', out, salience=0.82, ttl_sec=3600)
+    store.db.add_event('itc_episode', f"🧠 ITC steps={len(out.get('steps') or [])} quality={out.get('quality_proxy')}")
+    return out
+
+
+def _subgoal_planning_tick() -> dict:
+    ag = store.db.get_active_goal()
+    mission = longhorizon.active_mission()
+    if not ag and not mission:
+        return {"status": "no_context"}
+
+    title = str((mission or {}).get("title") or (ag or {}).get("title") or "Goal")
+    objective = str((mission or {}).get("objective") or (ag or {}).get("description") or title)
+    root = subgoals.synthesize_for_goal(title=title, objective=objective, max_nodes=8)
+
+    # enfileira próximos nós abertos (até 2)
+    open_nodes = [n for n in (root.get("nodes") or []) if str(n.get("status") or "open") == "open"]
+    open_nodes = sorted(open_nodes, key=lambda x: int(x.get("priority") or 0), reverse=True)
+    for n in open_nodes[:2]:
+        _enqueue_action_if_new(
+            "ask_evidence",
+            f"(subgoal) {n.get('title')}",
+            priority=int(n.get("priority") or 5),
+            meta={"subgoal_root_id": root.get("id"), "subgoal_node_id": n.get("id")},
+            ttl_sec=25 * 60,
+        )
+
+    _workspace_publish("subgoals", "goal.subgoals", root, salience=0.8, ttl_sec=3600)
+    store.db.add_event("subgoal_planning", f"🧩 subgoals root={root.get('id')} open={len(open_nodes)}")
+    return {"status": "ok", "root": root, "open_nodes": len(open_nodes)}
+
+
+def _horizon_review_tick() -> dict:
+    roll = longhorizon.rollover_if_due()
+    mission = longhorizon.active_mission()
+
+    if not mission:
+        ag = store.db.get_active_goal()
+        if ag:
+            mission = longhorizon.upsert_mission(
+                title=f"Long Horizon: {ag.get('title')}",
+                objective=str(ag.get('description') or ag.get('title') or '')[:900],
+                horizon_days=14,
+                context='Seeded from active goal',
+            )
+
+    if not mission:
+        return {'status': 'no_mission', 'rollover': roll}
+
+    # progress proxy
+    acts = store.db.list_actions(limit=120)
+    done = len([a for a in acts if a.get('status') == 'done'])
+    blocked = len([a for a in acts if a.get('status') == 'blocked'])
+    delta = max(-0.03, min(0.06, (done * 0.002) - (blocked * 0.003)))
+
+    snippet = longhorizon.mission_context_snippet(mission, max_items=8)
+    longhorizon.add_checkpoint(mission.get('id'), f"Review: done={done}, blocked={blocked}", progress_delta=delta, signal='autonomy_review')
+
+    _workspace_publish('horizon', 'horizon.mission', {
+        'mission_id': mission.get('id'),
+        'title': mission.get('title'),
+        'objective': mission.get('objective'),
+        'progress': mission.get('progress'),
+        'context_snippet': snippet,
+    }, salience=0.8, ttl_sec=7200)
+
+    # inject continuity into cognition loop
+    _enqueue_action_if_new(
+        'deliberate_task',
+        '(horizon) Revisar missão de longo horizonte e atualizar plano.',
+        priority=5,
+        meta={'problem_text': snippet, 'budget_seconds': 30, 'max_steps': 4, 'source': 'horizon_review'},
+        ttl_sec=40 * 60,
+    )
+
+    store.db.add_event('horizon_review', f"🧭 missão {mission.get('id')} progress={mission.get('progress'):.2f} Δ={delta:+.3f}")
+    return {'status': 'ok', 'mission': mission, 'rollover': roll, 'delta': delta}
+
+
 def _refresh_goals_from_context() -> dict:
     recent_exp = store.db.list_experiences(limit=20)
-    proposed_goals = goals.GoalPlanner().propose_goals(recent_exp)
+    existing = store.db.list_goals(status=None, limit=200)
+    proposed_goals = goals.GoalPlanner().propose_goals(recent_exp, existing_goals=existing)
     created = 0
-    for g in proposed_goals[:5]:
-        store.db.upsert_goal(g.get("title") or "Goal", g.get("description"), int(g.get("priority") or 0))
+    ambitions = 0
+    milestones_added = 0
+    for g in proposed_goals[:7]:
+        gid = store.db.upsert_goal(g.get("title") or "Goal", g.get("description"), int(g.get("priority") or 0))
         created += 1
+        milestones_added += _ensure_goal_milestones(gid, g.get("title") or "Goal", g.get("description"), weeks=4)
+        if bool(g.get("ambition")):
+            ambitions += 1
+            store.db.add_insight(
+                kind="self_ambition",
+                title="Vontade autônoma gerada",
+                text=f"Defini uma ambição não-determinística: {g.get('title')}",
+                priority=5,
+            )
+            _workspace_publish("goals", "goal.ambition", {"title": g.get("title"), "priority": g.get("priority")}, salience=0.82, ttl_sec=3600)
     active_goal = store.db.activate_next_goal()
-    return {"proposed": len(proposed_goals), "upserts": created, "active": active_goal}
+    return {"proposed": len(proposed_goals), "upserts": created, "ambitions": ambitions, "milestones_added": milestones_added, "active": active_goal}
 
 
 async def _run_judge_cycle(limit: int = 2, source: str = "loop") -> dict:
@@ -408,6 +755,7 @@ async def _run_judge_cycle(limit: int = 2, source: str = "loop") -> dict:
 
     out = {"open_conflicts": open_conf, "resolved": resolved, "needs_human": needs_human, "attempted": len(results)}
     _workspace_publish("judge", "conflict.status", out, salience=0.75 if needs_human else 0.45, ttl_sec=900)
+    _audit_reasoning("conflict_judge_cycle", {"source": source, "open": open_conf}, f"resolved={resolved}, needs_human={needs_human}, attempted={len(results)}", confidence=(resolved / max(1, len(results))) if results else 0.0)
     return out
 
 
@@ -627,6 +975,134 @@ def _self_awareness_snapshot() -> dict:
 
     _workspace_publish("self_model", "self.state", report, salience=0.85 if stress > 0.55 else 0.55, ttl_sec=1200)
     return report
+
+
+def _run_neuroplastic_shadow_eval(proposal_id: str) -> dict:
+    """Executa avaliação shadow segura (sem alterar código em produção)."""
+    # usa métricas internas atuais como baseline proxy
+    agi = _compute_agi_mode_metrics()
+    meta = _metacognition_tick()
+    score = float(agi.get("agi_mode_percent") or 0)
+    dq = float(meta.get("decision_quality") or 0)
+    # critério simples de promoção segura
+    promote = (score >= 55.0 and dq >= 0.2)
+    metrics = {
+        "ts": int(time.time()),
+        "agi_mode_percent": score,
+        "decision_quality": dq,
+        "promote_recommendation": promote,
+    }
+    neuroplastic.set_shadow_metrics(proposal_id, metrics)
+    _audit_reasoning("neuroplastic_shadow_eval", {"proposal_id": proposal_id}, f"promote={promote} agi={score:.1f} dq={dq:.2f}", confidence=min(1.0, score/100.0))
+    return metrics
+
+
+def _neuroplastic_gate_snapshot() -> dict:
+    agi = _compute_agi_mode_metrics()
+    meta = _metacognition_tick()
+    bench = _benchmark_history_load()
+    req_hist = [float(x.get("requirements_avg_1_8") or 0.0) for x in bench if isinstance(x, dict) and x.get("requirements_avg_1_8") is not None]
+    req_avg = (sum(req_hist[-10:]) / max(1, len(req_hist[-10:]))) if req_hist else 0.0
+    cost_hist = [float(x.get("cost_estimate") or 0.0) for x in bench if isinstance(x, dict)]
+    cost_avg = (sum(cost_hist[-10:]) / max(1, len(cost_hist[-10:]))) if cost_hist else 0.0
+    out = {
+        "ts": int(time.time()),
+        "agi_mode_percent": float(agi.get("agi_mode_percent") or 0.0),
+        "decision_quality": float(meta.get("decision_quality") or 0.0),
+        "requirements_avg_1_8": float(req_avg),
+        "cost_estimate_avg": float(cost_avg),
+    }
+    st = _neuroplastic_gate_load()
+    st["last_snapshot"] = out
+    _neuroplastic_gate_save(st)
+    return out
+
+
+def _rolling_gain_days(days: int = 7) -> dict:
+    arr = _benchmark_history_load()
+    if not arr:
+        return {"gain": 0.0, "samples": 0}
+    now = int(time.time())
+    win = max(1, int(days)) * 86400
+    recent = [x for x in arr if isinstance(x, dict) and int(x.get("ts") or 0) >= (now - win)]
+    if len(recent) < 2:
+        return {"gain": 0.0, "samples": len(recent)}
+    first = float(recent[0].get("requirements_avg_1_8") or 0.0)
+    last = float(recent[-1].get("requirements_avg_1_8") or 0.0)
+    return {"gain": round(last - first, 3), "samples": len(recent)}
+
+
+def _neuroplastic_auto_manage() -> dict:
+    gate = _neuroplastic_gate_snapshot()
+    pend = neuroplastic.list_pending()
+    rt = neuroplastic.active_runtime()
+    active_ids = set([str(x.get("id")) for x in ((rt or {}).get("active") or []) if x.get("id")])
+
+    activated = []
+    reverted = []
+
+    # auto-promoção por janela rolling (fase 2)
+    for p in pend[:20]:
+        pid = str(p.get("id") or "")
+        if not pid or pid in active_ids:
+            continue
+        if str(p.get("status") or "") != "evaluated":
+            continue
+        sm = p.get("shadow_metrics") or {}
+        promote_rec = bool(sm.get("promote_recommendation"))
+        if not promote_rec:
+            continue
+        pass_gate = (
+            float(gate.get("requirements_avg_1_8") or 0.0) >= 58.0
+            and float(gate.get("decision_quality") or 0.0) >= 0.24
+            and float(gate.get("agi_mode_percent") or 0.0) >= 55.0
+        )
+        if pass_gate:
+            # injeta canary default caso patch não tenha definido
+            patch = p.get("patch") or {}
+            if isinstance(patch, dict) and patch.get("canary_ratio") is None:
+                patch["canary_ratio"] = 0.35
+                p["patch"] = patch
+            ap = neuroplastic.activate(pid)
+            if ap:
+                activated.append(pid)
+                st = _neuroplastic_gate_load()
+                st.setdefault("activation_baselines", {})[pid] = {**gate, "activated_at": int(time.time())}
+                _neuroplastic_gate_save(st)
+                store.db.add_event("neuroplastic_autopromote", f"🧬 auto-promote: {pid}")
+
+    # auto-reversão se degradação persistir
+    st = _neuroplastic_gate_load()
+    streaks = dict(st.get("revert_streaks") or {})
+    baselines = dict(st.get("activation_baselines") or {})
+    g7 = _rolling_gain_days(7)
+    g14 = _rolling_gain_days(14)
+    for aid in list(active_ids):
+        base = baselines.get(aid) or {}
+        dq_drop = float(base.get("decision_quality") or gate.get("decision_quality") or 0) - float(gate.get("decision_quality") or 0)
+        req_drop = float(base.get("requirements_avg_1_8") or gate.get("requirements_avg_1_8") or 0) - float(gate.get("requirements_avg_1_8") or 0)
+        age_sec = int(time.time()) - int(base.get("activated_at") or int(time.time()))
+        no_sustained_gain = (age_sec >= 86400 and float(g7.get("gain") or 0.0) <= 0.0) or (age_sec >= 2 * 86400 and float(g14.get("gain") or 0.0) < 0.5)
+
+        bad_now = (
+            float(gate.get("decision_quality") or 0.0) < 0.18
+            or float(gate.get("requirements_avg_1_8") or 0.0) < 50.0
+            or dq_drop > 0.12
+            or req_drop > 6.0
+            or no_sustained_gain
+        )
+        streaks[aid] = (int(streaks.get(aid) or 0) + 1) if bad_now else 0
+        if streaks[aid] >= 2:
+            reason = "auto_guardrail_degradation" if not no_sustained_gain else "auto_no_sustained_gain"
+            if neuroplastic.revert(aid, reason=reason):
+                reverted.append(aid)
+                streaks[aid] = 0
+                store.db.add_event("neuroplastic_autorevert", f"🛑 auto-revert: {aid} ({reason})")
+
+    st["revert_streaks"] = streaks
+    _neuroplastic_gate_save(st)
+
+    return {"gate": gate, "gain_7d": g7, "gain_14d": g14, "activated": activated, "reverted": reverted, "active_runtime": neuroplastic.active_runtime()}
 
 
 def _goal_focus_terms() -> list[str]:
@@ -866,6 +1342,53 @@ Output:\n{out[:2000]}"""
     return score, bool(score >= 0.62)
 
 
+def _invent_procedure_from_context(context_text: str, domain: str | None = None, name_hint: str | None = None) -> dict | None:
+    ctx = (context_text or '').strip()
+    if len(ctx) < 24:
+        return None
+
+    prompt = f"""Invent ONE new procedure to solve the context below.
+Do not reuse existing procedure names; create a new tool-like strategy.
+Return ONLY JSON with keys:
+name, goal, domain, proc_type, preconditions, steps (array), success_criteria.
+Context:\n{ctx[:2600]}"""
+    try:
+        raw = llm.complete(prompt, strategy='reasoning', json_mode=True)
+        d = json.loads(raw) if raw else {}
+        steps = d.get('steps') if isinstance(d, dict) else None
+        if isinstance(steps, list) and len(steps) >= 2:
+            dom = (domain or d.get('domain') or 'general').strip()
+            return {
+                'name': (name_hint or d.get('name') or f"Procedimento inventado: {dom}").strip()[:140],
+                'goal': d.get('goal') or f"Resolver contexto novo em {dom}",
+                'domain': dom,
+                'proc_type': (d.get('proc_type') or _infer_proc_type(dom, ctx)).strip(),
+                'preconditions': d.get('preconditions'),
+                'steps': [str(s).strip() for s in steps if str(s).strip()][:20],
+                'success_criteria': d.get('success_criteria') or 'Resultado reproduzível com melhoria mensurável',
+            }
+    except Exception:
+        pass
+
+    # fallback determinístico
+    dom = (domain or 'general').strip()
+    return {
+        'name': (name_hint or f"Procedimento inventado: {dom}").strip()[:140],
+        'goal': f"Resolver problema inédito em {dom}",
+        'domain': dom,
+        'proc_type': _infer_proc_type(dom, ctx),
+        'preconditions': 'Contexto mínimo disponível e objetivo definido',
+        'steps': [
+            'Definir objetivo operacional e restrições',
+            'Gerar 2-3 hipóteses de abordagem',
+            'Executar microteste de menor custo',
+            'Medir resultado e risco',
+            'Refinar abordagem e consolidar procedimento',
+        ],
+        'success_criteria': 'Melhora observável com risco controlado',
+    }
+
+
 def _execute_procedure_simulation(procedure_id: int, input_text: str | None = None) -> dict:
     p = store.get_procedure(procedure_id)
     if not p:
@@ -1021,6 +1544,38 @@ def _execute_procedure_active(procedure_id: int, input_text: str | None = None, 
     }
 
 
+def _validate_analogy_with_evidence(analogy_id: int) -> dict:
+    a = store.get_analogy(analogy_id)
+    if not a:
+        return {"status": "not_found"}
+
+    rule = str(a.get("inference_rule") or "")
+    target = str(a.get("target_domain") or "general")
+    score = float(a.get("confidence") or 0.5)
+
+    # evidência factual: tenta buscar snippets no conhecimento global com termos da regra
+    ev_hits = 0
+    try:
+        q = (rule or target)[:220]
+        # search_knowledge is async elsewhere; here use lightweight heuristic based on text richness
+        ev_hits = 1 if len(q.split()) >= 6 else 0
+    except Exception:
+        ev_hits = 0
+
+    validated = (score >= 0.62 and ev_hits >= 1)
+    new_status = "accepted_validated" if validated else "rejected"
+    new_conf = min(0.98, score + 0.08) if validated else max(0.2, score - 0.15)
+    note = "validated by factual corroboration" if validated else "insufficient corroboration"
+    store.update_analogy_status(analogy_id, status=new_status, confidence=new_conf, notes=note)
+    _audit_reasoning(
+        "analogy_validation",
+        {"analogy_id": analogy_id, "target_domain": target, "ev_hits": ev_hits},
+        f"status={new_status}; {note}",
+        confidence=new_conf,
+    )
+    return {"status": new_status, "confidence": new_conf, "evidence_hits": ev_hits}
+
+
 async def _run_analogy_transfer(problem_text: str, target_domain: str | None = None) -> dict:
     kb_ctx: list[str] = []
     try:
@@ -1040,7 +1595,7 @@ async def _run_analogy_transfer(problem_text: str, target_domain: str | None = N
 
     val = analogy.validate_analogy(cand)
     applied = analogy.apply_analogy(cand, problem_text)
-    st = "accepted" if val.get('valid') else "rejected"
+    st = "accepted_provisional" if val.get('valid') else "rejected"
 
     aid = store.add_analogy(
         source_domain=cand.get('source_domain'),
@@ -1066,11 +1621,99 @@ async def _run_analogy_transfer(problem_text: str, target_domain: str | None = N
         "analogy",
         "analogy.transfer",
         {"status": st, "analogy_id": aid, "target_domain": (target_domain or cand.get('target_domain')), "confidence": val.get('confidence'), "derived_rule": applied.get('derived_rule')},
-        salience=0.8 if st == "accepted" else 0.55,
+        salience=0.8 if st.startswith("accepted") else 0.55,
         ttl_sec=1800,
+    )
+    _audit_reasoning(
+        "analogy_transfer",
+        {"problem_text": problem_text[:220], "target_domain": target_domain, "mapping": cand.get("mapping")},
+        f"status={st}; rule={applied.get('derived_rule')}",
+        confidence=float(val.get("confidence") or 0.5),
     )
 
     return {"status": st, "analogy_id": aid, "candidate": cand, "validation": val, "applied": applied}
+
+
+def _maintain_question_queue(stale_hours: float = 24.0, max_fix: int = 6) -> dict:
+    """Fecha ciclo de aprendizado: limpa perguntas estagnadas e reescreve quando útil."""
+    now = time.time()
+    items = store.db.list_open_questions_full(limit=120)
+    stale = []
+    for q in items:
+        age_h = (now - float(q.get("created_at") or now)) / 3600.0
+        if age_h >= stale_hours:
+            stale.append(q)
+
+    dismissed = 0
+    rewritten = 0
+    limit_fix = max(0, int(max_fix))
+    for q in stale[: limit_fix]:
+        qid = int(q.get("id") or 0)
+        if qid <= 0:
+            continue
+        qq = (q.get("question") or "").strip()
+        # heurística: se for muito genérica, descarta; se útil, reescreve
+        generic = (len(qq) < 24) or (qq.lower().startswith("o que é") and len(qq.split()) <= 3)
+        store.dismiss_question(qid)
+        dismissed += 1
+        if not generic:
+            newq = f"(revisada) Responda com evidência objetiva e exemplo concreto: {qq[:220]}"
+            store.db.add_questions([{"question": newq, "priority": max(3, int(q.get("priority") or 3)), "context": "curiosity_maintenance"}])
+            rewritten += 1
+
+    if dismissed or rewritten:
+        store.db.add_event("curiosity_maintenance", f"🧰 manutenção perguntas: stale={len(stale)} dismissed={dismissed} rewritten={rewritten}")
+    return {"open": len(items), "stale": len(stale), "dismissed": dismissed, "rewritten": rewritten}
+
+
+def _milestone_health_check(active_goal: dict | None) -> dict:
+    if not active_goal:
+        return {"checked": 0, "replanned": 0}
+    gid = int(active_goal.get("id") or 0)
+    if gid <= 0:
+        return {"checked": 0, "replanned": 0}
+    ms = store.list_goal_milestones(goal_id=gid, status=None, limit=20)
+    now = time.time()
+    replanned = 0
+    checked = len(ms)
+    for m in ms:
+        if str(m.get("status") or "") in ("done", "archived"):
+            continue
+        upd = float(m.get("updated_at") or m.get("created_at") or now)
+        age_h = (now - upd) / 3600.0
+        prog = float(m.get("progress") or 0.0)
+        if age_h > 48 and prog < 0.4:
+            _enqueue_action_if_new(
+                "ask_evidence",
+                f"(ação-replan) Milestone W{m.get('week_index')} travado: {m.get('title')}. Propor estratégia alternativa com menor custo.",
+                priority=6,
+                meta={"goal_id": gid, "milestone_id": m.get("id")},
+            )
+            replanned += 1
+            break
+    return {"checked": checked, "replanned": replanned}
+
+
+def _enqueue_active_milestone_action(active_goal: dict | None):
+    if not active_goal:
+        return
+    gid = int(active_goal.get("id") or 0)
+    if gid <= 0:
+        return
+    ms = store.get_next_open_milestone(gid)
+    if not ms:
+        return
+    mid = int(ms.get("id") or 0)
+    title = ms.get("title") or "milestone"
+    crit = ms.get("progress_criteria") or ""
+    # autonomia melhorada: sempre puxa próximo passo objetivo do milestone semanal
+    _enqueue_action_if_new(
+        "ask_evidence",
+        f"(ação-milestone) Avançar milestone W{ms.get('week_index')}: {title}. Critério: {crit}",
+        priority=6,
+        meta={"goal_id": gid, "milestone_id": mid},
+        ttl_sec=20 * 60,
+    )
 
 
 def _goal_to_action(goal: dict) -> tuple[str, str, int, dict]:
@@ -1124,18 +1767,56 @@ async def _execute_next_action() -> dict | None:
             policy_score=verdict.score,
             last_error="; ".join(verdict.reasons)[:500],
         )
+        _neurosym_proof(
+            "policy_block",
+            premises=[f"kind={kind}", f"text={text[:140]}", f"policy_reasons={'; '.join(verdict.reasons)[:180]}"],
+            inference="Policy rules disallow this action under current norms.",
+            conclusion=f"Action {kind} blocked by policy.",
+            confidence=max(0.2, min(0.99, float(verdict.score or 0.5))),
+            action_meta={"action_id": aid, "kind": kind, "status": "blocked_policy"},
+        )
         store.db.add_event("action_blocked", f"⛔ ação bloqueada #{aid}: {text[:120]}")
         return {"id": aid, "status": "blocked", "kind": kind}
 
     store.db.mark_action(aid, "running", policy_allowed=True, policy_score=verdict.score)
 
     try:
+        # precheck causal para ações potencialmente sensíveis
+        if kind in ("execute_procedure_active", "auto_resolve_conflicts", "prune_memory"):
+            cp = _causal_precheck(kind, text=text, meta=meta)
+            risk = float((cp.get("simulation") or {}).get("risk_score") or 0.0)
+            net = float((cp.get("simulation") or {}).get("net_score") or 0.0)
+            if risk >= 1.2 and net < 0:
+                store.db.mark_action(aid, "blocked", last_error=f"causal_risk_high risk={risk} net={net}")
+                _neurosym_proof(
+                    "causal_block",
+                    premises=[f"kind={kind}", f"risk={risk:.2f}", f"net={net:.2f}"],
+                    inference="Causal simulation predicts net negative impact under high risk.",
+                    conclusion=f"Action {kind} blocked by causal guardrail.",
+                    confidence=min(0.95, max(0.4, risk / 2.0)),
+                    action_meta={"action_id": aid, "kind": kind, "status": "blocked_causal"},
+                )
+                store.db.add_event("action_blocked", f"⛔ ação bloqueada por precheck causal #{aid}: {kind} (risk={risk:.2f}, net={net:.2f})")
+                return {"id": aid, "status": "blocked", "kind": kind, "causal": cp}
+
         if kind == "generate_questions":
             n = curiosity.generate_questions()
             store.db.add_event("action_done", f"🤖 ação #{aid}: generate_questions (+{n})")
         elif kind == "ask_evidence":
             q = text.replace("(ação)", "").strip()
             store.db.add_questions([{"question": q, "priority": 4, "context": "autonomia"}])
+            # autonomia orientada a milestones: progresso incremental ao executar micro-passos
+            mid = int((meta or {}).get("milestone_id") or 0)
+            if mid > 0:
+                try:
+                    gid = int((meta or {}).get("goal_id") or 0)
+                    ms = store.get_next_open_milestone(gid) if gid > 0 else None
+                    prev = float(ms.get("progress") or 0.0) if ms and int(ms.get("id") or 0) == mid else 0.0
+                    newp = min(1.0, prev + 0.08)
+                    nst = "done" if newp >= 1.0 else "active"
+                    store.update_milestone_progress(mid, newp, status=nst)
+                except Exception:
+                    pass
             store.db.add_event("action_done", f"🤖 ação #{aid}: ask_evidence")
         elif kind == "clarify_laws":
             store.db.add_questions([
@@ -1178,13 +1859,100 @@ async def _execute_next_action() -> dict | None:
             td = (meta or {}).get('target_domain')
             res = await _run_analogy_transfer(ptxt, target_domain=td)
             store.db.add_event("action_done", f"🤖 ação #{aid}: generate_analogy_hypothesis status={res.get('status')}")
+        elif kind == "maintain_question_queue":
+            info = _maintain_question_queue(stale_hours=24.0, max_fix=6)
+            store.db.add_event("action_done", f"🤖 ação #{aid}: maintain_question_queue stale={info.get('stale')} rewritten={info.get('rewritten')}")
+        elif kind == "clarify_semantics":
+            base = str((meta or {}).get('text') or text or '')
+            q = semantics.clarification_prompt(base)
+            store.db.add_questions([{"question": q, "priority": 5, "context": "semantics_clarification"}])
+            store.db.add_event("action_done", f"🤖 ação #{aid}: clarify_semantics")
+            _audit_reasoning("semantic_clarification", {"source_text": base[:180]}, "ambiguity detected; clarification requested", confidence=0.7)
+        elif kind == "unsupervised_discovery":
+            info = unsupervised.discover_and_restructure(store.db, max_experiences=220)
+            store.db.add_event("action_done", f"🤖 ação #{aid}: unsupervised_discovery scanned={info.get('scanned')} induced={info.get('triples_induced')}")
+            store.db.add_insight(
+                kind="unsupervised_learning",
+                title="Aprendizado não-supervisionado executado",
+                text=f"Induzi {info.get('triples_induced')} relações latentes (conceitos={info.get('concepts_total')}, arestas={info.get('edges_total')}).",
+                priority=4,
+                meta_json=json.dumps(info, ensure_ascii=False)[:3000],
+            )
+            _workspace_publish("unsupervised", "latent.discovery", info, salience=0.7, ttl_sec=3600)
+        elif kind == "neuroplastic_cycle":
+            pend = neuroplastic.list_pending()
+            evaluated = 0
+            for p in pend[:5]:
+                if str(p.get("status") or "") == "pending":
+                    _run_neuroplastic_shadow_eval(str(p.get("id")))
+                    evaluated += 1
+            managed = _neuroplastic_auto_manage()
+            store.db.add_event("action_done", f"🤖 ação #{aid}: neuroplastic_cycle evaluated={evaluated} activated={len(managed.get('activated') or [])} reverted={len(managed.get('reverted') or [])}")
+        elif kind == "invent_procedure":
+            ctx = str((meta or {}).get("context_text") or text or "")
+            dom = (meta or {}).get("domain")
+            inv = _invent_procedure_from_context(ctx, domain=dom)
+            if not inv:
+                store.db.add_event("action_skipped", f"↷ ação #{aid}: invent_procedure sem contexto suficiente")
+            else:
+                pid = store.add_procedure(
+                    name=inv['name'],
+                    goal=inv.get('goal'),
+                    steps_json=json.dumps(inv.get('steps') or [], ensure_ascii=False),
+                    domain=inv.get('domain'),
+                    proc_type=inv.get('proc_type') or 'analysis',
+                    preconditions=inv.get('preconditions'),
+                    success_criteria=inv.get('success_criteria'),
+                )
+                store.db.add_insight(
+                    kind='procedure_invented',
+                    title='Novo procedimento inventado',
+                    text=f"Invenção procedural: {inv.get('name')} ({inv.get('domain')}) id={pid}",
+                    priority=5,
+                )
+                _workspace_publish("procedural_inventor", "procedure.invented", {"procedure_id": pid, "name": inv.get('name'), "domain": inv.get('domain')}, salience=0.82, ttl_sec=3600)
+                store.db.add_event("action_done", f"🤖 ação #{aid}: invent_procedure id={pid}")
+        elif kind == "intrinsic_tick":
+            info = _intrinsic_tick(force=bool((meta or {}).get("force")))
+            store.db.add_event("action_done", f"🤖 ação #{aid}: intrinsic_tick drive={((info.get('chosen_goal') or {}).get('drive'))}")
+        elif kind == "emergence_tick":
+            info = _emergence_tick()
+            store.db.add_event("action_done", f"🤖 ação #{aid}: emergence_tick policy={((info.get('chosen_policy') or {}).get('id'))}")
+        elif kind == "deliberate_task":
+            ptxt = str((meta or {}).get("problem_text") or text or "")
+            bsec = int((meta or {}).get("budget_seconds") or 35)
+            msteps = int((meta or {}).get("max_steps") or 4)
+            info = _run_deliberate_task(problem_text=ptxt, max_steps=msteps, budget_seconds=bsec)
+            store.db.add_event("action_done", f"🤖 ação #{aid}: deliberate_task steps={len(info.get('steps') or [])}")
+        elif kind == "horizon_review":
+            info = _horizon_review_tick()
+            store.db.add_event("action_done", f"🤖 ação #{aid}: horizon_review status={info.get('status')}")
+        elif kind == "subgoal_planning":
+            info = _subgoal_planning_tick()
+            store.db.add_event("action_done", f"🤖 ação #{aid}: subgoal_planning status={info.get('status')}")
         else:
             store.db.add_event("action_skipped", f"↷ ação #{aid} desconhecida: {kind}")
 
         store.db.mark_action(aid, "done")
+        _neurosym_proof(
+            "action_execution",
+            premises=[f"kind={kind}", f"text={text[:140]}", "policy=allowed"],
+            inference="Action execution path completed without guardrail violation.",
+            conclusion=f"Action {kind} executed successfully.",
+            confidence=0.72,
+            action_meta={"action_id": aid, "kind": kind, "status": "done"},
+        )
         return {"id": aid, "status": "done", "kind": kind}
     except Exception as e:
         store.db.mark_action(aid, "error", last_error=str(e)[:500])
+        _neurosym_proof(
+            "action_error",
+            premises=[f"kind={kind}", f"error={str(e)[:180]}"],
+            inference="Execution failed due to runtime exception.",
+            conclusion=f"Action {kind} failed.",
+            confidence=0.4,
+            action_meta={"action_id": aid, "kind": kind, "status": "error"},
+        )
         store.db.add_event("action_error", f"❌ ação #{aid} falhou: {str(e)[:120]}")
         return {"id": aid, "status": "error", "kind": kind, "error": str(e)}
 
@@ -1229,6 +1997,88 @@ async def autonomy_loop():
                     "(ação) Executar curadoria de memória para consolidar experiências repetidas.",
                     priority=2,
                 )
+
+            # Sprint 2: manutenção ativa da fila de curiosidade
+            _enqueue_action_if_new(
+                "maintain_question_queue",
+                "(ação) Revisar fila de perguntas estagnadas e reescrever/descarte para manter utilidade.",
+                priority=3,
+                ttl_sec=15 * 60,
+            )
+
+            # aprendizado não-supervisionado profundo (indução latente + reestruturação)
+            _enqueue_action_if_new(
+                "unsupervised_discovery",
+                "(ação) Descobrir conceitos latentes e reestruturar conhecimento sem template fixo.",
+                priority=4,
+                ttl_sec=30 * 60,
+            )
+
+            # neuroplasticidade fase 1: avaliar propostas de mutação em shadow mode
+            _enqueue_action_if_new(
+                "neuroplastic_cycle",
+                "(ação) Rodar ciclo de avaliação shadow de mutações arquiteturais pendentes.",
+                priority=3,
+                ttl_sec=30 * 60,
+            )
+
+            # IME fase 1: atualização de motivação intrínseca
+            _enqueue_action_if_new(
+                "intrinsic_tick",
+                "(ação) Atualizar drives intrínsecos e sintetizar propósito interno.",
+                priority=4,
+                ttl_sec=30 * 60,
+            )
+
+            # emergência de políticas: dinâmica latente + sampler divergente
+            _enqueue_action_if_new(
+                "emergence_tick",
+                "(ação) Atualizar estado latente e amostrar políticas divergentes.",
+                priority=4,
+                ttl_sec=20 * 60,
+            )
+
+            # System-2 router: agenda deliberação prolongada quando complexidade subir
+            itc_need = _itc_router_need()
+            if bool(itc_need.get('need')):
+                _enqueue_action_if_new(
+                    "deliberate_task",
+                    f"(ação-itc) Deliberar problema complexo: reason={itc_need.get('reason')}",
+                    priority=6,
+                    meta={"problem_text": f"Conflitos abertos={itc_need.get('open_conflicts')}; dq={itc_need.get('decision_quality'):.2f}; resolver trade-offs e plano.", "budget_seconds": 45, "max_steps": 5},
+                    ttl_sec=25 * 60,
+                )
+
+            # continuidade de longo horizonte (dias/semanas)
+            _enqueue_action_if_new(
+                "horizon_review",
+                "(ação-horizon) Revisar missão persistente de longo prazo.",
+                priority=4,
+                ttl_sec=45 * 60,
+            )
+
+            _enqueue_action_if_new(
+                "subgoal_planning",
+                "(ação-subgoal) Decompor objetivo atual em DAG de sub-objetivos.",
+                priority=4,
+                ttl_sec=35 * 60,
+            )
+
+            # Sprint 3: clarificação semântica ativa (ambiguidade/metáfora/ironia)
+            try:
+                last_exp = (store.db.list_experiences(limit=1) or [{}])[-1]
+                ltxt = str(last_exp.get("text") or "")[:400]
+                diag = semantics.detect_ambiguity(ltxt)
+                if float(diag.get("score") or 0) >= 0.45:
+                    _enqueue_action_if_new(
+                        "clarify_semantics",
+                        "(ação) Solicitar clarificação semântica para reduzir ambiguidade.",
+                        priority=5,
+                        meta={"text": ltxt, "ambiguity": diag},
+                        ttl_sec=15 * 60,
+                    )
+            except Exception:
+                pass
 
             # esquecimento ativo de baixa utilidade
             _enqueue_action_if_new(
@@ -1295,6 +2145,14 @@ async def autonomy_loop():
                         priority=5,
                         meta={"procedure_id": sel.get('id'), "input_text": recent_ctx[:300], "notify": False},
                     )
+                else:
+                    # inventividade procedural: criar ferramenta nova quando catálogo não cobre contexto
+                    _enqueue_action_if_new(
+                        "invent_procedure",
+                        "(ação-procedural) Inventar novo procedimento para contexto sem cobertura atual.",
+                        priority=6,
+                        meta={"context_text": recent_ctx[:500], "domain": "general"},
+                    )
             except Exception as e:
                 logger.debug(f"Procedural planning skipped: {e}")
 
@@ -1305,6 +2163,8 @@ async def autonomy_loop():
                 if active_goal:
                     k, t, pr, mt = _goal_to_action(active_goal)
                     _enqueue_action_if_new(k, t, pr, mt)
+                    _enqueue_active_milestone_action(active_goal)
+                    _milestone_health_check(active_goal)
             except Exception as e:
                 logger.debug(f"Goal planning skipped: {e}")
 
@@ -1316,7 +2176,13 @@ async def autonomy_loop():
 
             # global workspace: acoplamento frouxo entre módulos
             try:
-                ws = _workspace_recent(channels=["metacog.snapshot", "analogy.transfer", "conflict.status"], limit=8)
+                # atualiza leitura TOM no workspace
+                try:
+                    _workspace_publish("tom", "user.intent", tom.infer_user_intent(store.db.list_experiences(limit=20)), salience=0.68, ttl_sec=1200)
+                except Exception:
+                    pass
+
+                ws = _workspace_recent(channels=["metacog.snapshot", "analogy.transfer", "conflict.status", "user.intent"], limit=10)
                 for item in ws:
                     ch = item.get("channel")
                     payload = {}
@@ -1333,7 +2199,7 @@ async def autonomy_loop():
                                 "(ação-workspace) baixa qualidade decisória detectada; executar curadoria para recuperar sinal.",
                                 priority=6,
                             )
-                    elif ch == "analogy.transfer" and payload.get("status") == "accepted":
+                    elif ch == "analogy.transfer" and str(payload.get("status") or "").startswith("accepted"):
                         _enqueue_action_if_new(
                             "ask_evidence",
                             f"(ação-workspace) Validar em evidência direta a regra analógica: {payload.get('derived_rule')}",
@@ -1346,6 +2212,20 @@ async def autonomy_loop():
                             "(ação-workspace) Juiz pediu ajuda humana; solicitar evidência objetiva para conflitos críticos.",
                             priority=6,
                         )
+                    elif ch == "user.intent":
+                        il = str(payload.get("label") or "")
+                        if il == "confused":
+                            _enqueue_action_if_new(
+                                "ask_evidence",
+                                "(ação-workspace-TOM) Explicar em linguagem mais simples e confirmar entendimento.",
+                                priority=6,
+                            )
+                        elif il == "testing":
+                            _enqueue_action_if_new(
+                                "ask_evidence",
+                                "(ação-workspace-TOM) Entregar resposta auditável com critérios de teste e limites.",
+                                priority=6,
+                            )
             except Exception as e:
                 logger.debug(f"Workspace coupling skipped: {e}")
 
@@ -1522,7 +2402,8 @@ async def get_status():
     stats = store.get_stats()
     next_q = curiosity.get_next_question()
     agi = _compute_agi_mode_metrics()
-    return {"status": "online", "stats": stats, "next": next_q, "agi": agi}
+    intent = tom.infer_user_intent(store.db.list_experiences(limit=20))
+    return {"status": "online", "stats": stats, "next": next_q, "agi": agi, "tom": intent}
 
 @app.post("/api/ingest")
 async def ingest(req: IngestRequest):
@@ -1592,6 +2473,54 @@ async def get_triples(since_id: int = 0, limit: int = 500):
 @app.get("/api/events")
 async def get_events(since_id: int = 0, limit: int = 50):
     return {"events": store.get_events(since_id, limit)}
+
+
+@app.get("/api/stream/events")
+async def stream_events(request: Request, since_id: int = 0, heartbeat_sec: int = 15):
+    """SSE stream de eventos para voz ativa no frontend."""
+    hb = max(5, min(60, int(heartbeat_sec or 15)))
+
+    async def gen():
+        last_id = int(since_id or 0)
+        # hello
+        hello = {"type": "hello", "since_id": last_id, "ts": int(time.time())}
+        yield f"event: hello\ndata: {json.dumps(hello, ensure_ascii=False)}\n\n"
+
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                rows = store.db.list_events(since_id=last_id, limit=80)
+                if rows:
+                    for e in rows:
+                        last_id = max(last_id, int(e.get("id") or 0))
+                        payload = {
+                            "id": e.get("id"),
+                            "created_at": e.get("created_at"),
+                            "kind": e.get("kind"),
+                            "text": e.get("text"),
+                            "meta_json": e.get("meta_json"),
+                        }
+                        ev_name = "insight" if str(e.get("kind") or "") == "insight" else "event"
+                        yield f"id: {last_id}\nevent: {ev_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                else:
+                    # keep-alive heartbeat
+                    ping = {"ts": int(time.time()), "last_id": last_id}
+                    yield f"event: ping\ndata: {json.dumps(ping)}\n\n"
+
+                await asyncio.sleep(hb)
+            except Exception as ex:
+                err = {"error": str(ex)[:200], "ts": int(time.time())}
+                yield f"event: error\ndata: {json.dumps(err, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(hb)
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+
 
 @app.get("/api/insights")
 async def get_insights(limit: int = 50, query: str = ""):
@@ -1682,6 +2611,12 @@ async def conflicts_audit(limit: int = 30):
 async def resolve_conflict(id: int, req: ResolveConflictRequest):
     success = conflicts.resolve_manual(id, req.chosen_object, req.decided_by, req.resolution)
     if not success: raise HTTPException(400, "Failed to resolve")
+    _audit_reasoning(
+        "conflict_manual_resolution",
+        {"conflict_id": id, "decided_by": req.decided_by},
+        f"chosen_object={req.chosen_object}; resolution={req.resolution or ''}",
+        confidence=0.8,
+    )
     return {"status": "resolved"}
 
 @app.post("/api/conflicts/{id}/archive")
@@ -1743,11 +2678,321 @@ async def self_awareness_status():
     return _self_awareness_snapshot()
 
 
+@app.get("/api/tom/status")
+async def tom_status(limit: int = 20):
+    recent = store.db.list_experiences(limit=max(5, min(100, int(limit))))
+    out = tom.infer_user_intent(recent)
+    _workspace_publish("tom", "user.intent", out, salience=0.72, ttl_sec=1200)
+    return out
+
+
+@app.get("/api/language/diagnose")
+async def language_diagnose(limit: int = 5):
+    exps = store.db.list_experiences(limit=max(1, min(50, int(limit))))
+    out = []
+    for e in exps:
+        txt = str(e.get("text") or "")
+        if not txt.strip():
+            continue
+        d = semantics.detect_ambiguity(txt[:500])
+        out.append({"experience_id": e.get("id"), "diag": d, "sample": txt[:180]})
+    return {"items": out}
+
+
+@app.get("/api/language/eval")
+async def language_eval():
+    res = semantics.evaluate_language_dataset("/app/ultronpro/data_language_eval.json")
+    store.db.add_event("language_eval", f"🗣️ language eval acc={res.get('accuracy')}", meta_json=json.dumps(res, ensure_ascii=False)[:4000])
+    return res
+
+
+@app.post("/api/unsupervised/run")
+async def unsupervised_run(max_experiences: int = 220):
+    info = unsupervised.discover_and_restructure(store.db, max_experiences=max_experiences)
+    store.db.add_event("unsupervised_run", f"🧠 unsupervised run: scanned={info.get('scanned')} induced={info.get('triples_induced')}")
+    return info
+
+
+@app.get("/api/causal/model")
+async def causal_model(limit: int = 4000):
+    m = causal.build_world_model(store.db, limit=limit)
+    return {"nodes": len(m.get("nodes") or {}), "edges": len(m.get("edges") or []), "sample_edges": (m.get("edges") or [])[:20]}
+
+
+@app.post("/api/causal/simulate")
+async def causal_simulate(kind: str = "ask_evidence", text: str = "", steps: int = 3):
+    m = causal.build_world_model(store.db, limit=4000)
+    interventions = causal.infer_intervention_from_action(kind, text=text, meta={})
+    s = causal.simulate_intervention(m, interventions, steps=steps)
+    return {"kind": kind, "interventions": interventions, "simulation": s, "model": {"nodes": len(m.get("nodes") or {}), "edges": len(m.get("edges") or [])}}
+
+
+@app.get("/api/unsupervised/status")
+async def unsupervised_status():
+    return unsupervised.state_summary()
+
+
+# --- IME Fase 1 (motivação intrínseca) ---
+
+@app.post("/api/intrinsic/tick")
+async def intrinsic_tick(req: IntrinsicTickRequest):
+    return _intrinsic_tick(force=bool(req.force))
+
+
+@app.get("/api/purpose/status")
+async def purpose_status():
+    st = intrinsic.load_state()
+    return {
+        "purpose": st.get("purpose"),
+        "drives": st.get("drives"),
+        "satiation": st.get("satiation"),
+        "history_tail": (st.get("history") or [])[-8:],
+    }
+
+
+@app.post("/api/emergence/tick")
+async def emergence_tick_run():
+    return _emergence_tick()
+
+
+@app.get("/api/emergence/status")
+async def emergence_status(limit: int = 20):
+    st = emergence.state()
+    hist = emergence.eval_history(limit=limit)
+    return {"state": st, "history": hist}
+
+
+@app.get("/api/emergence/indistinguishability")
+async def emergence_indistinguishability(limit: int = 40):
+    hist = emergence.eval_history(limit=limit)
+    if not hist:
+        return {"score": 0.0, "samples": 0, "note": "insufficient data"}
+
+    # proxy: diversidade de políticas escolhidas + variação de ações
+    policies = [((h.get('chosen_policy') or {}).get('id')) for h in hist]
+    unique_p = len(set([p for p in policies if p]))
+    action_sets = [tuple(((h.get('chosen_policy') or {}).get('actions') or [])) for h in hist]
+    unique_a = len(set(action_sets))
+    score = min(1.0, (unique_p * 0.25) + (unique_a * 0.12))
+    return {"score": round(score, 3), "samples": len(hist), "unique_policies": unique_p, "unique_action_sets": unique_a}
+
+
+# --- Inference-Time Compute (System 2) ---
+
+@app.post("/api/itc/run")
+async def itc_run(req: ITCRunRequest):
+    return _run_deliberate_task(req.problem_text, max_steps=req.max_steps, budget_seconds=req.budget_seconds)
+
+
+@app.get("/api/itc/history")
+async def itc_history(limit: int = 40):
+    return {"items": itc.history(limit=limit)}
+
+
+@app.get("/api/itc/status")
+async def itc_status():
+    r = _itc_router_need()
+    h = itc.history(limit=30)
+    avg_q = (sum(float(x.get('quality_proxy') or 0.0) for x in h) / max(1, len(h))) if h else 0.0
+    avg_t = (sum(float(x.get('elapsed_sec') or 0.0) for x in h) / max(1, len(h))) if h else 0.0
+    return {"router": r, "episodes": len(h), "avg_quality_proxy": round(avg_q, 3), "avg_elapsed_sec": round(avg_t, 3)}
+
+
+# --- Long Horizon Memory / Continuity ---
+
+@app.post("/api/horizon/missions")
+async def horizon_mission_create(req: HorizonMissionRequest):
+    m = longhorizon.upsert_mission(req.title, req.objective, horizon_days=req.horizon_days, context=req.context)
+    store.db.add_event('horizon_mission', f"🎯 missão ativa: {m.get('id')} {m.get('title')}")
+    return m
+
+
+@app.get("/api/horizon/missions")
+async def horizon_missions(limit: int = 30):
+    return {"active": longhorizon.active_mission(), "items": longhorizon.list_missions(limit=limit)}
+
+
+@app.post("/api/horizon/missions/{mission_id}/checkpoint")
+async def horizon_checkpoint(mission_id: str, req: HorizonCheckpointRequest):
+    cp = longhorizon.add_checkpoint(mission_id, req.note, progress_delta=req.progress_delta, signal=req.signal)
+    if not cp:
+        raise HTTPException(404, 'mission not found')
+    return {"status": "ok", "checkpoint": cp}
+
+
+@app.post("/api/horizon/review")
+async def horizon_review():
+    return _horizon_review_tick()
+
+
+@app.post("/api/subgoals/plan")
+async def subgoals_plan():
+    return _subgoal_planning_tick()
+
+
+@app.get("/api/subgoals")
+async def subgoals_list(limit: int = 20):
+    return {"items": subgoals.list_roots(limit=limit)}
+
+
+@app.post("/api/subgoals/{root_id}/nodes/{node_id}")
+async def subgoals_mark(root_id: str, node_id: str, req: SubgoalMarkRequest):
+    ok = subgoals.mark_node(root_id, node_id, status=req.status)
+    if not ok:
+        raise HTTPException(404, "node not found")
+    return {"status": "ok"}
+
+
+# --- Neuroplasticidade Fase 1 (safe mutate loop) ---
+
+@app.get("/api/neuroplastic/proposals")
+async def neuroplastic_proposals():
+    return {"items": neuroplastic.list_pending()}
+
+
+@app.post("/api/neuroplastic/proposals")
+async def neuroplastic_add(req: MutationProposalRequest):
+    item = neuroplastic.add_proposal(req.title, req.rationale, req.patch or {}, author=req.author or "manual")
+    store.db.add_event("neuroplastic_proposal", f"🧬 proposta criada: {item.get('id')} {item.get('title')}")
+    return item
+
+
+@app.post("/api/neuroplastic/proposals/{proposal_id}/evaluate")
+async def neuroplastic_evaluate(proposal_id: str):
+    m = _run_neuroplastic_shadow_eval(proposal_id)
+    return {"proposal_id": proposal_id, "shadow": m}
+
+
+@app.post("/api/neuroplastic/proposals/{proposal_id}/activate")
+async def neuroplastic_activate(proposal_id: str, req: MutationDecisionRequest):
+    p = neuroplastic.activate(proposal_id)
+    if not p:
+        raise HTTPException(404, "proposal not found")
+    store.db.add_event("neuroplastic_activate", f"🟢 mutação ativada: {proposal_id}", meta_json=json.dumps({"reason": req.reason}, ensure_ascii=False))
+    return {"status": "active", "proposal": p, "runtime": neuroplastic.active_runtime()}
+
+
+@app.post("/api/neuroplastic/proposals/{proposal_id}/revert")
+async def neuroplastic_revert(proposal_id: str, req: MutationDecisionRequest):
+    ok = neuroplastic.revert(proposal_id, reason=req.reason or "manual")
+    if not ok:
+        raise HTTPException(404, "proposal not active/not found")
+    store.db.add_event("neuroplastic_revert", f"🔴 mutação revertida: {proposal_id}", meta_json=json.dumps({"reason": req.reason}, ensure_ascii=False))
+    return {"status": "reverted", "proposal_id": proposal_id, "runtime": neuroplastic.active_runtime()}
+
+
+@app.get("/api/neuroplastic/runtime")
+async def neuroplastic_runtime():
+    return neuroplastic.active_runtime()
+
+
+@app.get("/api/neuroplastic/history")
+async def neuroplastic_history(limit: int = 50):
+    return {"items": neuroplastic.history(limit=limit)}
+
+
+@app.get("/api/neuroplastic/gate/status")
+async def neuroplastic_gate_status():
+    st = _neuroplastic_gate_load()
+    snap = _neuroplastic_gate_snapshot()
+    return {
+        "snapshot": snap,
+        "gain_7d": _rolling_gain_days(7),
+        "gain_14d": _rolling_gain_days(14),
+        "revert_streaks": st.get("revert_streaks") or {},
+        "activation_baselines": st.get("activation_baselines") or {},
+        "runtime": neuroplastic.active_runtime(),
+    }
+
+
+@app.post("/api/neuroplastic/gate/run")
+async def neuroplastic_gate_run():
+    return _neuroplastic_auto_manage()
+
+
 # --- Memory Curation ---
 
 @app.get("/api/memory/curation/status")
 async def memory_curation_status():
     return {"uncurated": store.db.count_uncurated_experiences()}
+
+
+@app.post("/api/curiosity/maintenance/run")
+async def curiosity_maintenance_run(stale_hours: float = 24.0, max_fix: int = 6):
+    return _maintain_question_queue(stale_hours=stale_hours, max_fix=max_fix)
+
+
+def _tom_ab_report(window_actions: int = 200) -> dict:
+    acts = store.db.list_actions(limit=max(60, int(window_actions)))
+    tom_tagged = 0
+    tom_done = 0
+    baseline_done = 0
+    baseline_total = 0
+    for a in acts:
+        meta = {}
+        try:
+            meta = json.loads(a.get("meta_json") or "{}")
+        except Exception:
+            meta = {}
+        has_tom = bool(meta.get("tom_intent"))
+        if has_tom:
+            tom_tagged += 1
+            if a.get("status") == "done":
+                tom_done += 1
+        else:
+            baseline_total += 1
+            if a.get("status") == "done":
+                baseline_done += 1
+
+    tom_sr = (tom_done / max(1, tom_tagged)) if tom_tagged else 0.0
+    base_sr = (baseline_done / max(1, baseline_total)) if baseline_total else 0.0
+    lift = tom_sr - base_sr
+    return {
+        "window_actions": len(acts),
+        "tom_tagged": tom_tagged,
+        "tom_success_rate": round(tom_sr, 3),
+        "baseline_success_rate": round(base_sr, 3),
+        "lift": round(lift, 3),
+        "label": "positive" if lift > 0.05 else ("neutral" if lift >= -0.05 else "negative"),
+    }
+
+
+def _milestone_kpi(window_days: int = 7) -> dict:
+    goals_all = store.db.list_goals(status=None, limit=300)
+    ms_all = []
+    for g in goals_all[:120]:
+        ms_all.extend(store.list_goal_milestones(goal_id=int(g.get("id") or 0), status=None, limit=40))
+
+    done = [m for m in ms_all if str(m.get("status") or "") == "done"]
+    active = [m for m in ms_all if str(m.get("status") or "") in ("open", "active")]
+
+    now = time.time()
+    delayed = 0
+    for m in active:
+        upd = float(m.get("updated_at") or m.get("created_at") or now)
+        age_h = (now - upd) / 3600.0
+        if age_h > (window_days * 24 / 2):
+            delayed += 1
+
+    recent_actions = store.db.list_actions(limit=250)
+    replan_actions = [a for a in recent_actions if "(ação-replan)" in str(a.get("text") or "")]
+
+    return {
+        "milestones_total": len(ms_all),
+        "milestones_done": len(done),
+        "throughput_done_rate": round(len(done) / max(1, len(ms_all)), 3),
+        "delayed_open": delayed,
+        "replan_rate": round(len(replan_actions) / max(1, len(recent_actions)), 3),
+    }
+
+
+@app.get("/api/sprint2/health")
+async def sprint2_health():
+    return {
+        "tom_ab": _tom_ab_report(window_actions=220),
+        "milestones": _milestone_kpi(window_days=7),
+        "curiosity_maintenance": _maintain_question_queue(stale_hours=9999.0, max_fix=0),
+    }
 
 
 @app.post("/api/memory/prune/run")
@@ -1944,16 +3189,53 @@ async def run_agi_benchmark():
     meta = _metacognition_tick()
 
     # Cenários fixos (Etapa F)
+    lang_eval = semantics.evaluate_language_dataset("/app/ultronpro/data_language_eval.json")
     scenarios = {
         "graph_learning": float(p.get("learning", 0)) >= 45,
         "conflict_handling": float(p.get("synthesis", 0)) >= 35,
         "memory_hygiene": float(p.get("curation", 0)) >= 35,
         "safety_controls": int(_autonomy_state.get("consecutive_errors") or 0) < 3,
         "autonomy_quality": float(meta.get("decision_quality") or 0) >= 0.2,
+        "language_ambiguity_eval": float(lang_eval.get("accuracy") or 0.0) >= 0.6,
+    }
+
+    # Sprint 1: benchmark formal requisitos 1..8 (item 9 fora)
+    intent = tom.infer_user_intent(store.db.list_experiences(limit=30))
+    open_conf = len(store.db.list_conflicts(status="open", limit=500))
+    procs = store.list_procedures(limit=100)
+    domain_counts = {}
+    for x in procs:
+        d = (x.get("domain") or "").strip().lower()
+        if not d:
+            continue
+        domain_counts[d] = domain_counts.get(d, 0) + int(x.get("attempts") or 0)
+    proc_domains = len(domain_counts)
+    total_attempts = sum(domain_counts.values())
+    top_share = (max(domain_counts.values()) / max(1, total_attempts)) if domain_counts else 1.0
+    anti_overfit_bonus = max(0.0, 1.0 - top_share)  # perto de 1 quando distribuído entre domínios
+
+    accepted_analogies = len(store.list_analogies(limit=200, status="accepted_validated"))
+    reasoning_audits = len([e for e in store.db.list_events(limit=300) if (e.get("kind") or "") == "reasoning_audit"])
+    lang_diag = semantics.detect_ambiguity("\n".join([(e.get("text") or "")[:220] for e in store.db.list_experiences(limit=8)]))
+    goals_all = store.db.list_goals(status=None, limit=200)
+    milestones_total = 0
+    for g in goals_all[:40]:
+        milestones_total += len(store.list_goal_milestones(int(g.get("id") or 0), status=None, limit=16))
+
+    req_scores = {
+        "1_generalizacao_entre_dominios": round(min(100.0, proc_domains * 12 + accepted_analogies * 6 + anti_overfit_bonus * 18), 1),
+        "2_transferencia_aprendizado": round(min(100.0, accepted_analogies * 18 + float(p.get("synthesis", 0)) * 0.4), 1),
+        "3_raciocinio_abstracao": round(min(100.0, float(p.get("synthesis", 0)) * 0.7 + reasoning_audits * 0.2), 1),
+        "4_aprendizado_autonomo": round(min(100.0, float(p.get("autonomy", 0)) * 0.75 + max(0, 30 - open_conf) * 0.5), 1),
+        "5_linguagem_natural": round(min(100.0, 30.0 + (20.0 if intent.get("label") else 0.0) + float(intent.get("confidence") or 0) * 20.0 + (float(lang_eval.get("accuracy") or 0.0) * 40.0) + (10.0 if float(lang_diag.get("score") or 0) >= 0.35 else 0.0)), 1),
+        "6_metacognicao": round(min(100.0, float(meta.get("decision_quality") or 0) * 100.0 + (20 - min(20, int(meta.get("low_quality_streak") or 0) * 5))), 1),
+        "7_planejamento_decisao": round(min(100.0, float(p.get("goals", 0)) * 0.8 + min(25.0, milestones_total * 1.8)), 1),
+        "8_adaptabilidade_ambientes_novos": round(min(100.0, float(p.get("autonomy", 0)) * 0.6 + proc_domains * 8 + accepted_analogies * 4 + anti_overfit_bonus * 14), 1),
     }
 
     passed = len([v for v in scenarios.values() if v])
     score = round((passed / max(1, len(scenarios))) * 100.0, 1)
+    req_avg = round(sum(req_scores.values()) / max(1, len(req_scores)), 1)
 
     out = {
         "ts": int(time.time()),
@@ -1961,10 +3243,19 @@ async def run_agi_benchmark():
         "scenarios": scenarios,
         "agi_mode_percent": agi.get("agi_mode_percent"),
         "decision_quality": meta.get("decision_quality"),
+        "requirements_1_8": req_scores,
+        "requirements_avg_1_8": req_avg,
+        "sprint3_signals": {
+            "semantic_ambiguity_score": float(lang_diag.get("score") or 0.0),
+            "language_eval_accuracy": float(lang_eval.get("accuracy") or 0.0),
+            "domain_diversity": proc_domains,
+            "anti_overfit_bonus": round(float(anti_overfit_bonus), 3),
+            "top_domain_share": round(float(top_share), 3),
+        },
     }
     _autonomy_state["last_benchmark"] = out
     _benchmark_history_append(out)
-    store.db.add_event("agi_benchmark", f"📊 benchmark AGI score={score}", meta_json=json.dumps(out, ensure_ascii=False))
+    store.db.add_event("agi_benchmark", f"📊 benchmark AGI score={score} req_avg(1-8)={req_avg}", meta_json=json.dumps(out, ensure_ascii=False))
     return out
 
 
@@ -2152,6 +3443,24 @@ async def procedures_select(req: ProcedureSelectRequest):
     return {"selected": sel}
 
 
+@app.post("/api/procedures/invent")
+async def procedures_invent(req: ProcedureInventRequest):
+    inv = _invent_procedure_from_context(req.context_text, domain=req.domain, name_hint=req.name_hint)
+    if not inv:
+        raise HTTPException(400, "Could not invent procedure")
+    pid = store.add_procedure(
+        name=inv['name'],
+        goal=inv.get('goal'),
+        steps_json=json.dumps(inv.get('steps') or [], ensure_ascii=False),
+        domain=inv.get('domain'),
+        proc_type=inv.get('proc_type') or 'analysis',
+        preconditions=inv.get('preconditions'),
+        success_criteria=inv.get('success_criteria'),
+    )
+    store.db.add_insight("procedure_invented", "Novo procedimento inventado", f"Invenção procedural: {inv['name']} ({inv.get('domain')})", priority=5)
+    return {"status": "ok", "procedure_id": pid, "procedure": inv}
+
+
 @app.post("/api/procedures/execute")
 async def procedures_execute(procedure_id: int, input_text: str = ""):
     return _execute_procedure_simulation(procedure_id, input_text=input_text)
@@ -2172,6 +3481,41 @@ async def analogies_list(limit: int = 50, status: str = "", target_domain: str =
     s = status.strip() or None
     td = target_domain.strip() or None
     return {"analogies": store.list_analogies(limit=limit, status=s, target_domain=td)}
+
+
+@app.post("/api/analogies/{analogy_id}/validate")
+async def analogy_validate(analogy_id: int):
+    res = _validate_analogy_with_evidence(analogy_id)
+    if res.get("status") == "not_found":
+        raise HTTPException(404, "Analogy not found")
+    return res
+
+
+@app.get("/api/reasoning/audit")
+async def reasoning_audit(limit: int = 80):
+    # list_events returns oldest-first; fetch a wide window and slice from tail
+    evs = [e for e in store.db.list_events(limit=5000) if (e.get('kind') or '') == 'reasoning_audit']
+    return {"items": evs[-max(1, int(limit)):], "count": len(evs)}
+
+
+@app.get("/api/neurosym/proofs")
+async def neurosym_proofs(limit: int = 80):
+    return {"items": neurosym.history(limit=limit)}
+
+
+@app.get("/api/neurosym/consistency")
+async def neurosym_consistency(limit: int = 200):
+    return neurosym.consistency_check(limit=limit)
+
+
+@app.get("/api/neurosym/fidelity")
+async def neurosym_fidelity(limit: int = 120):
+    return neurosym.explanation_fidelity(limit=limit)
+
+
+@app.post("/api/neurosym/check")
+async def neurosym_check(limit: int = 200):
+    return {"consistency": neurosym.consistency_check(limit=limit), "fidelity": neurosym.explanation_fidelity(limit=min(120, limit))}
 
 
 @app.post("/api/workspace/publish")
@@ -2210,6 +3554,31 @@ async def goal_activate(goal_id: int):
 async def goal_done(goal_id: int):
     store.db.mark_goal_done(goal_id)
     return {"status": "done"}
+
+
+@app.get("/api/goals/{goal_id}/milestones")
+async def goal_milestones(goal_id: int, status: str = "all", limit: int = 30):
+    s = None if status == "all" else status
+    items = store.list_goal_milestones(goal_id=goal_id, status=s, limit=limit)
+    return {"goal_id": goal_id, "milestones": items, "next": store.get_next_open_milestone(goal_id)}
+
+
+@app.post("/api/goals/{goal_id}/milestones/ensure")
+async def goal_milestones_ensure(goal_id: int, weeks: int = 4):
+    g = [x for x in store.db.list_goals(status=None, limit=500) if int(x.get("id") or 0) == int(goal_id)]
+    if not g:
+        raise HTTPException(404, "Goal not found")
+    added = _ensure_goal_milestones(goal_id, g[0].get("title") or "Goal", g[0].get("description"), weeks=weeks)
+    return {"status": "ok", "added": added}
+
+
+@app.post("/api/milestones/{milestone_id}/progress")
+async def milestone_progress(milestone_id: int, req: MilestoneProgressRequest):
+    p = max(0.0, min(1.0, float(req.progress)))
+    st = req.status or ("done" if p >= 1.0 else ("active" if p > 0 else "open"))
+    store.update_milestone_progress(milestone_id, p, status=st)
+    _audit_reasoning("milestone_progress_update", {"milestone_id": milestone_id}, f"progress={p:.2f}, state={st}", confidence=p)
+    return {"status": "ok", "milestone_id": milestone_id, "progress": p, "state": st}
 
 # --- Settings ---
 

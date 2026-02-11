@@ -1,0 +1,52 @@
+[
+  {
+    "id": "amb_001",
+    "text": "Quando você diz que o sistema está 'pesado', você fala de consumo de CPU ou de lentidão percebida?",
+    "expected": "high_ambiguity"
+  },
+  {
+    "id": "amb_002",
+    "text": "Ele quebrou tudo... quer dizer, quase tudo, só a parte de deploy ficou intacta.",
+    "expected": "medium_ambiguity"
+  },
+  {
+    "id": "amb_003",
+    "text": "Claro, ótima ideia subir direto em produção sem teste algum...",
+    "expected": "high_ambiguity"
+  },
+  {
+    "id": "amb_004",
+    "text": "A memória está suja e precisamos fazer curadoria para reduzir ruído.",
+    "expected": "low_ambiguity"
+  },
+  {
+    "id": "amb_005",
+    "text": "A arquitetura do átomo é como um sistema solar em miniatura.",
+    "expected": "medium_ambiguity"
+  },
+  {
+    "id": "amb_006",
+    "text": "Talvez a solução dependa do contexto regulatório, não apenas da regra técnica.",
+    "expected": "medium_ambiguity"
+  },
+  {
+    "id": "amb_007",
+    "text": "Resolva o conflito escolhendo a variante com maior evidência factual.",
+    "expected": "low_ambiguity"
+  },
+  {
+    "id": "amb_008",
+    "text": "Isso é literalmente impossível, no sentido figurado.",
+    "expected": "high_ambiguity"
+  },
+  {
+    "id": "amb_009",
+    "text": "Ele disse que estava frio e ficou gelado com o resultado.",
+    "expected": "medium_ambiguity"
+  },
+  {
+    "id": "amb_010",
+    "text": "Atualize as dependências e reinicie o serviço com rollback se falhar.",
+    "expected": "low_ambiguity"
+  }
+]

@@ -136,6 +136,22 @@ class Store:
             )
             c.execute(
                 """
+                CREATE TABLE IF NOT EXISTS goal_milestones(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  goal_id INTEGER NOT NULL,
+                  created_at REAL NOT NULL,
+                  updated_at REAL,
+                  week_index INTEGER NOT NULL DEFAULT 1,
+                  title TEXT NOT NULL,
+                  progress_criteria TEXT,
+                  status TEXT NOT NULL DEFAULT 'open',
+                  progress REAL NOT NULL DEFAULT 0.0,
+                  FOREIGN KEY(goal_id) REFERENCES goals(id)
+                )
+                """
+            )
+            c.execute(
+                """
                 CREATE TABLE IF NOT EXISTS conflicts(
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   created_at REAL NOT NULL,
@@ -946,7 +962,7 @@ class Store:
         with self._conn() as c:
             rows = c.execute(
                 """
-                SELECT id, created_at, updated_at, status, kind, text, priority, policy_allowed, policy_score, last_error, expires_at, cooldown_key
+                SELECT id, created_at, updated_at, status, kind, text, priority, policy_allowed, policy_score, last_error, meta_json, expires_at, cooldown_key
                 FROM actions
                 ORDER BY id DESC
                 LIMIT ?
@@ -1053,6 +1069,80 @@ class Store:
     def mark_goal_done(self, goal_id: int):
         with self._conn() as c:
             c.execute("UPDATE goals SET status='done' WHERE id=?", (int(goal_id),))
+
+    def add_goal_milestone(self, goal_id: int, week_index: int, title: str, progress_criteria: str | None = None) -> int:
+        now = _ts()
+        with self._conn() as c:
+            # de-dupe por goal+title
+            row = c.execute(
+                "SELECT id FROM goal_milestones WHERE goal_id=? AND title=? AND status IN ('open','active') ORDER BY id DESC LIMIT 1",
+                (int(goal_id), (title or '').strip()),
+            ).fetchone()
+            if row:
+                return int(row[0])
+            cur = c.execute(
+                """
+                INSERT INTO goal_milestones(goal_id,created_at,updated_at,week_index,title,progress_criteria,status,progress)
+                VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (int(goal_id), now, now, int(max(1, week_index)), (title or 'Milestone')[:180], progress_criteria, 'open', 0.0),
+            )
+            return int(cur.lastrowid)
+
+    def list_goal_milestones(self, goal_id: int, status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            if status:
+                rows = c.execute(
+                    """
+                    SELECT id, goal_id, created_at, updated_at, week_index, title, progress_criteria, status, progress
+                    FROM goal_milestones
+                    WHERE goal_id=? AND status=?
+                    ORDER BY week_index ASC, id ASC
+                    LIMIT ?
+                    """,
+                    (int(goal_id), status, int(limit)),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    """
+                    SELECT id, goal_id, created_at, updated_at, week_index, title, progress_criteria, status, progress
+                    FROM goal_milestones
+                    WHERE goal_id=?
+                    ORDER BY week_index ASC, id ASC
+                    LIMIT ?
+                    """,
+                    (int(goal_id), int(limit)),
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_next_open_milestone(self, goal_id: int) -> dict[str, Any] | None:
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT id, goal_id, created_at, updated_at, week_index, title, progress_criteria, status, progress
+                FROM goal_milestones
+                WHERE goal_id=? AND status IN ('open','active')
+                ORDER BY week_index ASC, id ASC
+                LIMIT 1
+                """,
+                (int(goal_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_milestone_progress(self, milestone_id: int, progress: float, status: str | None = None):
+        now = _ts()
+        p = max(0.0, min(1.0, float(progress)))
+        with self._conn() as c:
+            if status:
+                c.execute(
+                    "UPDATE goal_milestones SET progress=?, status=?, updated_at=? WHERE id=?",
+                    (p, status, now, int(milestone_id)),
+                )
+            else:
+                c.execute(
+                    "UPDATE goal_milestones SET progress=?, updated_at=? WHERE id=?",
+                    (p, now, int(milestone_id)),
+                )
 
     # --- procedures (procedural memory)
     def add_procedure(
@@ -1221,6 +1311,19 @@ class Store:
                 """,
                 ((status or 'hypothesis')[:24], _ts(), float(confidence) if confidence is not None else None, notes, int(analogy_id)),
             )
+
+    def get_analogy(self, analogy_id: int) -> dict[str, Any] | None:
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT id, created_at, updated_at, status, source_domain, target_domain, source_concept, target_concept,
+                       mapping_json, inference_rule, confidence, evidence_refs_json, notes
+                FROM analogies
+                WHERE id=?
+                """,
+                (int(analogy_id),),
+            ).fetchone()
+        return dict(row) if row else None
 
     # --- global workspace (metacognição compartilhada)
     def publish_workspace(
@@ -2194,6 +2297,9 @@ def list_analogies(limit: int = 50, status: str | None = None, target_domain: st
 def update_analogy_status(analogy_id: int, status: str, confidence: float | None = None, notes: str | None = None):
     return db.update_analogy_status(analogy_id, status=status, confidence=confidence, notes=notes)
 
+def get_analogy(analogy_id: int):
+    return db.get_analogy(analogy_id)
+
 def publish_workspace(module: str, channel: str, payload_json: str | None, salience: float = 0.5, ttl_sec: int = 900):
     return db.publish_workspace(module, channel, payload_json, salience=salience, ttl_sec=ttl_sec)
 
@@ -2211,6 +2317,18 @@ def activate_next_goal():
 
 def mark_goal_done(goal_id: int):
     return db.mark_goal_done(goal_id)
+
+def add_goal_milestone(goal_id: int, week_index: int, title: str, progress_criteria: str | None = None):
+    return db.add_goal_milestone(goal_id, week_index, title, progress_criteria)
+
+def list_goal_milestones(goal_id: int, status: str | None = None, limit: int = 20):
+    return db.list_goal_milestones(goal_id, status=status, limit=limit)
+
+def get_next_open_milestone(goal_id: int):
+    return db.get_next_open_milestone(goal_id)
+
+def update_milestone_progress(milestone_id: int, progress: float, status: str | None = None):
+    return db.update_milestone_progress(milestone_id, progress, status=status)
 
 # Backwards compatibility alias
 add_triple = add_or_reinforce_triple

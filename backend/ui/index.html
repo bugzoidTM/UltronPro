@@ -479,6 +479,39 @@
       <div class="card" style="margin-bottom: 20px;">
         <div class="card-body" style="padding: 12px 16px;">
           <div class="muted" id="autonomyOps">Autonomia: carregando...</div>
+          <div class="muted" id="reqScores" style="margin-top:8px">Requisitos 1-8: carregando...</div>
+          <div class="muted" id="sprint2Health" style="margin-top:8px">Sprint 2: carregando...</div>
+        </div>
+      </div>
+
+      <div class="grid-2" style="margin-bottom: 20px;">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title"><span class="icon">🎯</span> Currículo da Ambição (Goal Ativo)</div>
+            <button class="btn btn-sm btn-secondary" onclick="loadGoalCurriculum()">🔄 Refresh</button>
+          </div>
+          <div class="card-body">
+            <div id="goalCurriculum" class="muted">(carregando...)</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title"><span class="icon">🧠</span> Teoria da Mente (Intento do Usuário)</div>
+            <button class="btn btn-sm btn-secondary" onclick="loadTomStatus()">🔄 Refresh</button>
+          </div>
+          <div class="card-body">
+            <div id="tomIntent" class="muted">(carregando...)</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom: 20px;">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">🧭</span> Missão de Longo Horizonte</div>
+          <button class="btn btn-sm btn-secondary" onclick="loadHorizonStatus()">🔄 Refresh</button>
+        </div>
+        <div class="card-body">
+          <div id="horizonMission" class="muted">(carregando...)</div>
         </div>
       </div>
 
@@ -772,22 +805,61 @@
 
     // === API ===
     async function api(url, opts = {}) {
-      const r = await fetch(url, opts);
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.detail || 'Error');
-      return j;
+      const timeoutMs = opts.timeoutMs || 12000;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const r = await fetch(url, { ...opts, signal: controller.signal });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.detail || 'Error');
+        return j;
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
     // === Status & Questions ===
     let currentQ = null;
 
+    let _statusTick = 0;
     async function loadStatus() {
       try {
-        const st = await api('/api/status');
-        const aut = await api('/api/autonomy/status');
-        const mem = await api('/api/memory/status');
-        const meta = await api('/api/metacognition/status');
-        const bench = await api('/api/agi/benchmark/trend?limit=7');
+        _statusTick += 1;
+        const slowCycle = (_statusTick % 4) === 0; // ~20s when base is 5s
+
+        // Fast endpoints (frequent)
+        const [st, aut] = await Promise.all([
+          api('/api/status', { timeoutMs: 8000 }),
+          api('/api/autonomy/status', { timeoutMs: 8000 }),
+        ]);
+
+        // Slow endpoints (batched less frequently)
+        let mem = window.__memCache || {};
+        let meta = window.__metaCache || {};
+        let bench = window.__benchCache || { history: [], avg_score: 0 };
+        let benchStatus = window.__benchStatusCache || {};
+        let sprint2 = window.__sprint2Cache || {};
+
+        if (slowCycle || !window.__memCache) {
+          const slowResults = await Promise.allSettled([
+            api('/api/memory/status', { timeoutMs: 8000 }),
+            api('/api/metacognition/status', { timeoutMs: 8000 }),
+            api('/api/agi/benchmark/trend?limit=7', { timeoutMs: 10000 }),
+            api('/api/agi/benchmark/status', { timeoutMs: 10000 }),
+            api('/api/sprint2/health', { timeoutMs: 10000 }),
+          ]);
+          mem = slowResults[0].status === 'fulfilled' ? slowResults[0].value : mem;
+          meta = slowResults[1].status === 'fulfilled' ? slowResults[1].value : meta;
+          bench = slowResults[2].status === 'fulfilled' ? slowResults[2].value : bench;
+          benchStatus = slowResults[3].status === 'fulfilled' ? slowResults[3].value : benchStatus;
+          sprint2 = slowResults[4].status === 'fulfilled' ? slowResults[4].value : sprint2;
+          window.__memCache = mem;
+          window.__metaCache = meta;
+          window.__benchCache = bench;
+          window.__benchStatusCache = benchStatus;
+          window.__sprint2Cache = sprint2;
+        }
+
         document.getElementById('statExp').textContent = st.stats?.experiences || 0;
         document.getElementById('statTriples').textContent = st.stats?.triples || 0;
         document.getElementById('statAnswered').textContent = st.stats?.questions_answered || 0;
@@ -816,7 +888,31 @@
           const hist = (bench?.history || []).map(h => Number(h.score||0).toFixed(0)).join(',');
           ao.textContent = `Autonomia: budget ${budget.used_last_minute||0}/${budget.per_minute||'-'} por min • queued ${aut.queued||0} • expired ${aut.expired_recent||0} • circuit breaker ${breaker} • metacog q=${dq}, stuck=${stuck}, replans=${replans} • benchmark avg7=${avgBench}% [${hist}] • memória: uncurated ${mem.uncurated||0}, archived ${mem.archived||0}, distilled ${mem.distilled||0}`;
         }
+        const req = benchStatus?.requirements_1_8 || {};
+        const reqAvg = Number(benchStatus?.requirements_avg_1_8 || 0).toFixed(1);
+        const rs = document.getElementById('reqScores');
+        if (rs) {
+          const small = Object.entries(req).map(([k,v]) => `${k.replace(/^[0-9]+_/, '').slice(0,12)}=${Number(v||0).toFixed(0)}%`).join(' • ');
+          const s3 = benchStatus?.sprint3_signals || {};
+          const langTrend = (bench?.history || []).map(h => Number(((h.sprint3_signals||{}).language_eval_accuracy||0)*100).toFixed(0)).join(',');
+          rs.textContent = `Requisitos 1-8 avg=${reqAvg}% • ${small || 'rode /api/agi/benchmark/run'} • Sprint3(lang_acc=${Number((s3.language_eval_accuracy||0)*100).toFixed(0)}%, dom_div=${s3.domain_diversity||0}, trend=[${langTrend}])`;
+        }
+        const s2 = document.getElementById('sprint2Health');
+        if (s2) {
+          const t = sprint2?.tom_ab || {};
+          const m = sprint2?.milestones || {};
+          s2.textContent = `Sprint2: ToM A/B lift=${Number(t.lift||0).toFixed(2)} (${t.label||'-'}) • milestones done=${m.milestones_done||0}/${m.milestones_total||0} throughput=${Number((m.throughput_done_rate||0)*100).toFixed(0)}% delayed=${m.delayed_open||0} replan_rate=${Number((m.replan_rate||0)*100).toFixed(0)}%`;
+        }
         
+        const tom = st.tom || {};
+        const tomEl = document.getElementById('tomIntent');
+        if (tomEl && tom.label) {
+          tomEl.innerHTML = `
+            <div><span class="tag tag-purple">${escHtml(tom.label)}</span> <span class="muted">conf=${Number(tom.confidence || 0).toFixed(2)}</span></div>
+            <div style="margin-top:8px">${escHtml(tom.rationale || '')}</div>
+          `;
+        }
+
         currentQ = st.next;
         if (currentQ) {
           document.getElementById('questionText').textContent = currentQ.question;
@@ -920,22 +1016,58 @@
 
     // === Feed ===
     let lastEventId = 0;
+    let sse = null;
+
+    function appendFeedEvents(events) {
+      if (!events || !events.length) return;
+      const feed = document.getElementById('feed');
+      const html = events.map(e => {
+        const ts = new Date((e.created_at || 0) * 1000).toLocaleTimeString();
+        return `<div class="feed-item"><span class="time">[${ts}]</span> <span class="kind">${escHtml(e.kind || 'event')}:</span> ${escHtml(e.text || '')}</div>`;
+      }).join('');
+      feed.innerHTML = (feed.innerHTML === '(aguardando eventos...)' ? '' : feed.innerHTML) + html;
+      feed.scrollTop = feed.scrollHeight;
+      lastEventId = Math.max(lastEventId, ...events.map(e => Number(e.id || 0)));
+    }
+
     async function loadFeed() {
       try {
         const j = await api('/api/events?since_id=' + lastEventId + '&limit=50');
-        const events = j.events || [];
-        if (events.length) {
-          lastEventId = Math.max(lastEventId, ...events.map(e => e.id || 0));
-          const feed = document.getElementById('feed');
-          const html = events.map(e => {
-            const ts = new Date((e.created_at || 0) * 1000).toLocaleTimeString();
-            return `<div class="feed-item"><span class="time">[${ts}]</span> <span class="kind">${e.kind}:</span> ${escHtml(e.text)}</div>`;
-          }).join('');
-          feed.innerHTML = (feed.innerHTML === '(aguardando eventos...)' ? '' : feed.innerHTML) + html;
-          feed.scrollTop = feed.scrollHeight;
-        }
+        appendFeedEvents(j.events || []);
       } catch (e) {
         console.error('loadFeed error:', e);
+      }
+    }
+
+    function startEventStream() {
+      try {
+        if (sse) {
+          sse.close();
+          sse = null;
+        }
+        sse = new EventSource('/api/stream/events?since_id=' + lastEventId + '&heartbeat_sec=10');
+
+        sse.addEventListener('event', (ev) => {
+          try {
+            const d = JSON.parse(ev.data || '{}');
+            appendFeedEvents([d]);
+          } catch (_) {}
+        });
+
+        sse.addEventListener('insight', (ev) => {
+          try {
+            const d = JSON.parse(ev.data || '{}');
+            appendFeedEvents([d]);
+            showToast('💡 ' + (d.text || 'Novo insight'));
+          } catch (_) {}
+        });
+
+        sse.addEventListener('error', () => {
+          // fallback silencioso para polling
+          console.warn('SSE disconnected; polling fallback remains active');
+        });
+      } catch (e) {
+        console.warn('SSE start failed:', e);
       }
     }
 
@@ -1123,14 +1255,12 @@
           return;
         }
         
-        // Load full details
-        const full = [];
-        for (const c of conflicts) {
-          try {
-            const cj = await api('/api/conflicts/' + c.id);
-            full.push(cj.conflict);
-          } catch { full.push(c); }
-        }
+        // Load full details in parallel (bounded)
+        const limited = conflicts.slice(0, 12);
+        const detailResults = await Promise.allSettled(
+          limited.map(c => api('/api/conflicts/' + c.id, { timeoutMs: 7000 }))
+        );
+        const full = detailResults.map((r, i) => (r.status === 'fulfilled' ? r.value.conflict : limited[i]));
         
         document.getElementById('conflictsList').innerHTML = full.map(c => {
           const vars = c.variants || [];
@@ -1289,6 +1419,148 @@
       }
     }
 
+    // === Goal Curriculum + ToM + Long Horizon ===
+    async function loadTomStatus() {
+      try {
+        const t = await api('/api/tom/status?limit=30');
+        const el = document.getElementById('tomIntent');
+        if (!el) return;
+        el.innerHTML = `
+          <div><span class="tag tag-purple">${escHtml(t.label || 'unknown')}</span> <span class="muted">conf=${Number(t.confidence || 0).toFixed(2)}</span></div>
+          <div style="margin-top:8px">${escHtml(t.rationale || '')}</div>
+          <div class="muted" style="margin-top:8px">${escHtml((t.evidence_excerpt || '').slice(0,160))}</div>
+        `;
+      } catch (e) {
+        const el = document.getElementById('tomIntent');
+        if (el) el.innerHTML = `<span style="color:var(--accent-red)">Erro ToM: ${escHtml(e.message)}</span>`;
+      }
+    }
+
+    async function loadHorizonStatus() {
+      try {
+        const hz = await api('/api/horizon/missions?limit=12', { timeoutMs: 9000 });
+        const el = document.getElementById('horizonMission');
+        if (!el) return;
+
+        const active = hz.active;
+        if (!active) {
+          el.innerHTML = '<div class="muted">(sem missão ativa)</div>';
+          return;
+        }
+
+        const cps = (active.checkpoints || []).slice(-5).reverse();
+        const cpHtml = cps.length
+          ? cps.map(c => `<div class="list-item"><div><span class="tag tag-purple">${escHtml(c.signal || 'checkpoint')}</span> <span class="muted">${new Date((Number(c.ts)||0)*1000).toLocaleString()}</span></div><div style="margin-top:6px">${escHtml(c.note || '')}</div></div>`).join('')
+          : '<div class="muted">Sem checkpoints ainda.</div>';
+
+        const progressPct = Math.round(Number(active.progress || 0) * 100);
+        const dueStr = active.due_at ? new Date(Number(active.due_at) * 1000).toLocaleString() : '-';
+
+        el.innerHTML = `
+          <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+            <div>
+              <div><strong>${escHtml(active.title || 'Missão')}</strong></div>
+              <div class="muted" style="margin-top:6px">${escHtml(active.objective || '')}</div>
+              <div class="muted" style="margin-top:6px">Prazo: ${escHtml(dueStr)} • Horizonte: ${Number(active.horizon_days || 0)}d</div>
+            </div>
+            <div class="tag tag-blue">${progressPct}%</div>
+          </div>
+          <div class="trust-bar" style="margin-top:10px"><div class="trust-fill trust-high" style="width:${progressPct}%"></div></div>
+          <div style="margin-top:10px">
+            <button class="btn btn-sm btn-secondary" onclick="runHorizonReview()">🌀 Rodar review</button>
+          </div>
+          <div style="margin-top:12px">${cpHtml}</div>
+        `;
+      } catch (e) {
+        const el = document.getElementById('horizonMission');
+        if (el) el.innerHTML = `<span style="color:var(--accent-red)">Erro horizonte: ${escHtml(e.message)}</span>`;
+      }
+    }
+
+    async function runHorizonReview() {
+      try {
+        await api('/api/horizon/review', { method: 'POST', timeoutMs: 12000 });
+        showToast('✅ Review de horizonte executado');
+        await loadHorizonStatus();
+      } catch (e) {
+        showToast('❌ ' + e.message, 'error');
+      }
+    }
+
+    async function loadGoalCurriculum() {
+      try {
+        const gs = await api('/api/goals?status=all&limit=50');
+        const active = gs.active;
+        const el = document.getElementById('goalCurriculum');
+        if (!el) return;
+        if (!active) {
+          el.innerHTML = '<div class="muted">(sem goal ativo)</div>';
+          return;
+        }
+
+        const gId = active.id;
+        const ms = await api(`/api/goals/${gId}/milestones?limit=20`);
+        const arr = ms.milestones || [];
+        if (!arr.length) {
+          el.innerHTML = `
+            <div><strong>${escHtml(active.title || 'Goal')}</strong></div>
+            <div class="muted" style="margin-top:8px">Sem milestones ainda.</div>
+            <div style="margin-top:10px"><button class="btn btn-sm btn-secondary" onclick="ensureMilestones(${gId})">🧩 Gerar currículo semanal</button></div>
+          `;
+          return;
+        }
+
+        const next = ms.next;
+        const items = arr.map(m => {
+          const p = Math.round(Number(m.progress || 0) * 100);
+          const isNext = next && Number(next.id) === Number(m.id);
+          return `
+            <div class="list-item">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+                <div><strong>W${m.week_index}</strong> — ${escHtml(m.title || '')} ${isNext ? '<span class="tag tag-green" style="margin-left:8px">next</span>' : ''}</div>
+                <span class="tag tag-blue">${p}%</span>
+              </div>
+              <div class="muted" style="margin-top:6px">${escHtml(m.progress_criteria || '')}</div>
+              <div class="trust-bar" style="margin-top:8px"><div class="trust-fill trust-high" style="width:${p}%"></div></div>
+              ${isNext ? `<div style="margin-top:8px"><button class="btn btn-sm" onclick="advanceMilestone(${m.id}, ${Math.min(1, (Number(m.progress||0)+0.25)).toFixed(2)})">⬆️ Avançar +25%</button></div>` : ''}
+            </div>
+          `;
+        }).join('');
+
+        el.innerHTML = `
+          <div style="margin-bottom:10px"><strong>${escHtml(active.title || 'Goal')}</strong></div>
+          ${items}
+        `;
+      } catch (e) {
+        const el = document.getElementById('goalCurriculum');
+        if (el) el.innerHTML = `<span style="color:var(--accent-red)">Erro currículo: ${escHtml(e.message)}</span>`;
+      }
+    }
+
+    async function ensureMilestones(goalId) {
+      try {
+        await api(`/api/goals/${goalId}/milestones/ensure?weeks=4`, { method: 'POST' });
+        showToast('✅ Currículo semanal gerado');
+        await loadGoalCurriculum();
+      } catch (e) {
+        showToast('❌ ' + e.message, 'error');
+      }
+    }
+
+    async function advanceMilestone(mid, progress) {
+      try {
+        await api(`/api/milestones/${mid}/progress`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ progress })
+        });
+        showToast('✅ Milestone atualizado');
+        await loadGoalCurriculum();
+      } catch (e) {
+        showToast('❌ ' + e.message, 'error');
+      }
+    }
+
     // === Utils ===
     function escHtml(s) {
       return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -1374,9 +1646,47 @@
     // === Init ===
     loadStatus();
     loadSources();
-    setInterval(loadStatus, 5000);
-    setInterval(loadFeed, 2000);
-    setInterval(() => { if (network) graphTick(); }, 2000);
+    loadGoalCurriculum();
+    loadTomStatus();
+    loadHorizonStatus();
+    loadFeed();
+    startEventStream();
+
+    let statusIntervalMs = 5000;
+    let graphIntervalMs = 3000;
+    let slowIntervalMs = 15000;
+    let _timers = [];
+
+    function clearTimers() {
+      _timers.forEach(t => clearInterval(t));
+      _timers = [];
+    }
+
+    function setupTimers() {
+      clearTimers();
+      _timers.push(setInterval(loadStatus, statusIntervalMs));
+      _timers.push(setInterval(loadFeed, statusIntervalMs)); // fallback in case SSE drops
+      _timers.push(setInterval(() => { if (network) graphTick(); }, graphIntervalMs));
+      _timers.push(setInterval(loadGoalCurriculum, slowIntervalMs));
+      _timers.push(setInterval(loadTomStatus, slowIntervalMs));
+      _timers.push(setInterval(loadHorizonStatus, slowIntervalMs));
+    }
+
+    function updatePollingMode() {
+      if (document.hidden) {
+        statusIntervalMs = 15000;
+        graphIntervalMs = 10000;
+        slowIntervalMs = 30000;
+      } else {
+        statusIntervalMs = 5000;
+        graphIntervalMs = 3000;
+        slowIntervalMs = 15000;
+      }
+      setupTimers();
+    }
+
+    document.addEventListener('visibilitychange', updatePollingMode);
+    updatePollingMode();
 
     // Enter key for search
     document.getElementById('searchInput').addEventListener('keypress', e => {
