@@ -2,6 +2,7 @@ import os
 import logging
 from typing import Dict, Optional, Any
 from ultronpro.settings import get_api_key
+from ultronpro import persona
 
 # --- API Models ---
 from pydantic import BaseModel
@@ -58,6 +59,12 @@ class LLMRouter:
         return client
 
     def complete(self, prompt: str, strategy: str = "default", system: str = None, json_mode: bool = False) -> str:
+        # runtime personality injection (dynamic system prompt + few-shot exemplars)
+        try:
+            system = persona.build_system_prompt(system)
+        except Exception:
+            pass
+
         config = MODELS.get(strategy, MODELS["default"])
         provider = config["provider"]
         model = config["model"]

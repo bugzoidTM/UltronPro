@@ -481,6 +481,7 @@
           <div class="muted" id="autonomyOps">Autonomia: carregando...</div>
           <div class="muted" id="reqScores" style="margin-top:8px">Requisitos 1-8: carregando...</div>
           <div class="muted" id="sprint2Health" style="margin-top:8px">Sprint 2: carregando...</div>
+          <div id="conflictsPreview" class="muted" style="margin-top:10px">Conflitos: carregando...</div>
         </div>
       </div>
 
@@ -512,6 +513,23 @@
         </div>
         <div class="card-body">
           <div id="horizonMission" class="muted">(carregando...)</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom: 20px;">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">🎭</span> Persona Runtime</div>
+          <button class="btn btn-sm btn-secondary" onclick="loadPersonaStatus()">🔄 Refresh</button>
+        </div>
+        <div class="card-body">
+          <div id="personaStatus" class="muted">(carregando...)</div>
+          <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
+            <input id="personaTone" type="text" placeholder="tone (ex: direct,auditable)" style="flex:1; min-width:220px;">
+            <input id="personaFewShot" type="number" min="1" max="6" value="3" style="width:90px;">
+            <button class="btn btn-sm" onclick="savePersonaConfig()">💾 Salvar</button>
+          </div>
+          <div style="margin-top:8px;" class="muted">Top exemplos por score:</div>
+          <div id="personaExamples" class="muted" style="margin-top:6px"></div>
         </div>
       </div>
 
@@ -1021,11 +1039,26 @@
     function appendFeedEvents(events) {
       if (!events || !events.length) return;
       const feed = document.getElementById('feed');
-      const html = events.map(e => {
+      if (!feed) return;
+
+      if (feed.innerHTML === '(aguardando eventos...)') feed.innerHTML = '';
+
+      const frag = document.createDocumentFragment();
+      for (const e of events) {
         const ts = new Date((e.created_at || 0) * 1000).toLocaleTimeString();
-        return `<div class="feed-item"><span class="time">[${ts}]</span> <span class="kind">${escHtml(e.kind || 'event')}:</span> ${escHtml(e.text || '')}</div>`;
-      }).join('');
-      feed.innerHTML = (feed.innerHTML === '(aguardando eventos...)' ? '' : feed.innerHTML) + html;
+        const div = document.createElement('div');
+        div.className = 'feed-item';
+        div.innerHTML = `<span class="time">[${ts}]</span> <span class="kind">${escHtml(e.kind || 'event')}:</span> ${escHtml(e.text || '')}`;
+        frag.appendChild(div);
+      }
+      feed.appendChild(frag);
+
+      // cap DOM nodes to avoid browser freeze on long sessions
+      const maxItems = 250;
+      while (feed.children.length > maxItems) {
+        feed.removeChild(feed.firstChild);
+      }
+
       feed.scrollTop = feed.scrollHeight;
       lastEventId = Math.max(lastEventId, ...events.map(e => Number(e.id || 0)));
     }
@@ -1113,21 +1146,34 @@
 
     async function graphTick() {
       try {
-        const j = await api('/api/graph/triples?since_id=' + lastTripleId + '&limit=500');
+        if (document.hidden) return;
+        const j = await api('/api/graph/triples?since_id=' + lastTripleId + '&limit=180', { timeoutMs: 7000 });
         const triples = j.triples || [];
-        
+
         for (const t of triples) {
           lastTripleId = Math.max(lastTripleId, t.id || 0);
           const a = nid(t.subject);
           const b = nid(t.object);
-          
+
           const key = a + '|' + t.predicate + '|' + b;
           if (edgeKeySet.has(key)) continue;
           edgeKeySet.add(key);
-          
+
           edgeData.add({ id: 'e' + edgeKeySet.size, from: a, to: b, label: t.predicate });
         }
-        
+
+        // cap graph size to prevent memory spikes
+        const maxNodes = 600;
+        const maxEdges = 1200;
+        if (nodeData.length > maxNodes) {
+          const ids = nodeData.getIds();
+          nodeData.remove(ids.slice(0, nodeData.length - maxNodes));
+        }
+        if (edgeData.length > maxEdges) {
+          const ids = edgeData.getIds();
+          edgeData.remove(ids.slice(0, edgeData.length - maxEdges));
+        }
+
         document.getElementById('graphStats').textContent = `nós=${nodeData.length} arestas=${edgeData.length}`;
       } catch (e) {
         console.error('graphTick error:', e);
@@ -1243,6 +1289,24 @@
     }
 
     // === Conflicts ===
+    async function loadConflictsSummary() {
+      try {
+        const j = await api('/api/conflicts?status=open&limit=5', { timeoutMs: 7000 });
+        const conflicts = j.conflicts || [];
+        const el = document.getElementById('conflictsPreview');
+        if (!el) return;
+        if (!conflicts.length) {
+          el.innerHTML = 'Conflitos: nenhum aberto ✅';
+          return;
+        }
+        const line = conflicts.slice(0, 3).map(c => `#${c.id} ${escHtml(c.subject || '')} ${escHtml(c.predicate || '')}`).join(' • ');
+        el.innerHTML = `Conflitos abertos: <strong>${conflicts.length}</strong> — ${line}`;
+      } catch (e) {
+        const el = document.getElementById('conflictsPreview');
+        if (el) el.innerHTML = `Conflitos: erro ao carregar (${escHtml(e.message)})`;
+      }
+    }
+
     async function loadConflicts() {
       try {
         const j = await api('/api/conflicts?status=open&limit=20');
@@ -1487,6 +1551,63 @@
       }
     }
 
+    async function loadPersonaStatus() {
+      try {
+        const st = await api('/api/persona/status', { timeoutMs: 9000 });
+        const ex = await api('/api/persona/examples?limit=20', { timeoutMs: 9000 });
+        const runtime = st.runtime || {};
+        const cfg = st.config || {};
+
+        const statusEl = document.getElementById('personaStatus');
+        const examplesEl = document.getElementById('personaExamples');
+        if (statusEl) {
+          statusEl.innerHTML = `
+            <div><span class="tag tag-purple">valence=${Number(runtime.valence || 0).toFixed(2)}</span> <span class="tag tag-blue">arousal=${Number(runtime.arousal || 0).toFixed(2)}</span></div>
+            <div style="margin-top:6px"><strong>Goal:</strong> ${escHtml(runtime.active_goal || 'none')}</div>
+            <div class="muted" style="margin-top:4px"><strong>Purpose:</strong> ${escHtml(runtime.purpose || '')}</div>
+            <div class="muted" style="margin-top:4px">examples=${Number(runtime.example_count || 0)}</div>
+          `;
+        }
+
+        const tone = document.getElementById('personaTone');
+        const k = document.getElementById('personaFewShot');
+        if (tone) tone.value = cfg.desired_tone || '';
+        if (k) k.value = Number(cfg.few_shot_k || 3);
+
+        const items = (ex.items || []).slice().sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+        if (examplesEl) {
+          examplesEl.innerHTML = items.slice(0, 5).map(it => `
+            <div class="list-item">
+              <div style="display:flex;justify-content:space-between;gap:8px;">
+                <span class="tag tag-green">score=${Number(it.score || 0).toFixed(2)}</span>
+                <span class="muted">${escHtml(it.tone || '')}</span>
+              </div>
+              <div style="margin-top:6px">${escHtml((it.assistant || '').slice(0, 140))}</div>
+            </div>
+          `).join('') || '<span class="muted">Sem exemplos ainda.</span>';
+        }
+      } catch (e) {
+        const statusEl = document.getElementById('personaStatus');
+        if (statusEl) statusEl.innerHTML = `<span style="color:var(--accent-red)">Erro persona: ${escHtml(e.message)}</span>`;
+      }
+    }
+
+    async function savePersonaConfig() {
+      try {
+        const tone = (document.getElementById('personaTone')?.value || '').trim();
+        const k = Number(document.getElementById('personaFewShot')?.value || 3);
+        await api('/api/persona/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ config: { desired_tone: tone, few_shot_k: Math.max(1, Math.min(6, k)) } })
+        });
+        showToast('✅ Persona atualizada');
+        await loadPersonaStatus();
+      } catch (e) {
+        showToast('❌ ' + e.message, 'error');
+      }
+    }
+
     async function loadGoalCurriculum() {
       try {
         const gs = await api('/api/goals?status=all&limit=50');
@@ -1649,6 +1770,8 @@
     loadGoalCurriculum();
     loadTomStatus();
     loadHorizonStatus();
+    loadPersonaStatus();
+    loadConflictsSummary();
     loadFeed();
     startEventStream();
 
@@ -1670,16 +1793,18 @@
       _timers.push(setInterval(loadGoalCurriculum, slowIntervalMs));
       _timers.push(setInterval(loadTomStatus, slowIntervalMs));
       _timers.push(setInterval(loadHorizonStatus, slowIntervalMs));
+      _timers.push(setInterval(loadPersonaStatus, slowIntervalMs));
+      _timers.push(setInterval(loadConflictsSummary, slowIntervalMs));
     }
 
     function updatePollingMode() {
       if (document.hidden) {
-        statusIntervalMs = 15000;
-        graphIntervalMs = 10000;
-        slowIntervalMs = 30000;
+        statusIntervalMs = 20000;
+        graphIntervalMs = 20000;
+        slowIntervalMs = 45000;
       } else {
         statusIntervalMs = 5000;
-        graphIntervalMs = 3000;
+        graphIntervalMs = 4000;
         slowIntervalMs = 15000;
       }
       setupTimers();

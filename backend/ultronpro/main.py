@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
-from ultronpro import llm, knowledge_bridge, graph, settings, curiosity, conflicts, store, extract, planner, goals, autofeeder, policy, analogy, tom, semantics, unsupervised, neuroplastic, causal, intrinsic, emergence, itc, longhorizon, subgoals, neurosym, project_kernel, tool_router, project_executor, integrity
+from ultronpro import llm, knowledge_bridge, graph, settings, curiosity, conflicts, store, extract, planner, goals, autofeeder, policy, analogy, tom, semantics, unsupervised, neuroplastic, causal, intrinsic, emergence, itc, longhorizon, subgoals, neurosym, project_kernel, tool_router, project_executor, integrity, self_model, env_tools, persona
 from ultronpro.knowledge_bridge import search_knowledge, ingest_knowledge
 
 # Logging
@@ -157,6 +157,25 @@ class ToolRouteRequest(BaseModel):
 class IntegrityRulesPatchRequest(BaseModel):
     rules: Dict[str, Any]
 
+class SandboxWriteRequest(BaseModel):
+    path: str
+    content: str
+
+class SandboxRunRequest(BaseModel):
+    code: Optional[str] = None
+    file_path: Optional[str] = None
+    timeout_sec: int = 15
+
+class PersonaExampleRequest(BaseModel):
+    user_input: str
+    assistant_output: str
+    tone: str = 'direct'
+    tags: Optional[List[str]] = None
+    score: float = 1.0
+
+class PersonaConfigRequest(BaseModel):
+    config: Dict[str, Any]
+
 class PersistentGoalRequest(BaseModel):
     title: str
     description: Optional[str] = None
@@ -225,6 +244,9 @@ ACTION_COOLDOWNS_SEC = {
     "project_management_cycle": 1500,
     "route_toolchain": 420,
     "project_experiment_cycle": 1800,
+    "absorb_lightrag_general": 2400,
+    "self_model_refresh": 1800,
+    "execute_python_sandbox": 300,
 }
 
 # Etapa E: executor externo com segurança
@@ -850,6 +872,233 @@ def _project_experiment_cycle() -> dict:
     return {'status': 'ok', 'project_id': p.get('id'), 'experiment': rec}
 
 
+async def _absorb_lightrag_general(max_topics: int = 24, doc_limit: int = 24, domains: str = "python,systems,database,ai") -> dict:
+    base_topics = [
+        # python
+        'python descriptor protocol __get__ __set__ __set_name__',
+        'python asyncio cancellation CancelledError',
+        'python GIL threading multiprocessing',
+        'python typing Protocol runtime_checkable structural subtyping',
+        # systems / db / ai
+        'postgresql indexing query planning explain analyze',
+        'sqlite pragmas optimize analyze indexing',
+        'distributed systems retries backoff idempotency',
+        'observability metrics tracing structured logs',
+        'machine learning overfitting regularization evaluation split',
+        'retrieval augmented generation reranking chunking strategy',
+        'security least privilege secrets management hardening',
+        'api resilience circuit breaker timeout bulkhead',
+    ]
+
+    # context-driven topics from active project/goal
+    try:
+        pg = project_kernel.active_project()
+    except Exception:
+        pg = None
+    ag = store.db.get_active_goal()
+    dynamic = []
+    if pg:
+        dynamic.append(str(pg.get('title') or ''))
+        dynamic.append(str(pg.get('objective') or ''))
+    if ag:
+        dynamic.append(str(ag.get('title') or ''))
+        dynamic.append(str(ag.get('description') or ''))
+
+    dom_tokens = [d.strip() for d in str(domains or '').split(',') if d.strip()]
+    topics = []
+    for t in base_topics:
+        if not dom_tokens or any(d.lower() in t.lower() for d in dom_tokens):
+            topics.append(t)
+    for d in dynamic:
+        if len(d.strip()) >= 12:
+            topics.append(d[:180])
+
+    added = 0
+    scanned = 0
+    snippets = []
+
+    for q in topics[:max(1, int(max_topics))]:
+        scanned += 1
+        try:
+            res = await search_knowledge(q, top_k=8)
+            if not res:
+                continue
+            txt = str((res[0] or {}).get('text') or '').strip()
+            if len(txt) < 120:
+                continue
+            sid = f"lightrag:absorb:{abs(hash(q)) % 100000}"
+            exp_id = store.add_experience(text=txt[:5000], source_id=sid, modality='text')
+            try:
+                _extract_and_update_graph(txt[:5000], exp_id)
+            except Exception:
+                pass
+            try:
+                _extract_python_triples_deep(txt[:5000], max_triples=8)
+            except Exception:
+                pass
+            added += 1
+            snippets.append({'q': q[:90], 'chars': len(txt)})
+        except Exception:
+            continue
+
+    try:
+        docs = await knowledge_bridge.fetch_random_documents(limit=max(1, int(doc_limit)))
+    except Exception:
+        docs = []
+
+    for d in docs[:max(1, int(doc_limit))]:
+        body = str(d.get('content') or '')
+        if len(body) < 120:
+            continue
+        sid = f"lightrag:{d.get('id') or 'doc'}"
+        exp_id = store.add_experience(text=body[:5000], source_id=sid, modality='text')
+        try:
+            _extract_and_update_graph(body[:5000], exp_id)
+        except Exception:
+            pass
+        try:
+            _extract_python_triples_deep(body[:5000], max_triples=6)
+        except Exception:
+            pass
+        added += 1
+
+    store.db.add_event('lightrag_absorb', f"📚 absorção geral: scanned={scanned} added={added}")
+    _workspace_publish('lightrag_absorb', 'lightrag.absorb', {'scanned': scanned, 'added': added, 'samples': snippets[:8], 'domains': dom_tokens}, salience=0.82, ttl_sec=3600)
+    return {'status': 'ok', 'scanned_topics': scanned, 'added_experiences': added, 'samples': snippets[:10], 'domains': dom_tokens}
+
+
+async def _absorb_python_from_lightrag(max_topics: int = 24, doc_limit: int = 24) -> dict:
+    return await _absorb_lightrag_general(max_topics=max_topics, doc_limit=doc_limit, domains='python')
+
+
+def _extract_python_triples_deep(text: str, max_triples: int = 10) -> int:
+    t = (text or '').strip()
+    if len(t) < 120:
+        return 0
+
+    added = 0
+    try:
+        prompt = f"""Extract up to {max(3, min(20, int(max_triples)))} high-value Python knowledge triples.
+Return ONLY JSON array of objects: {{"subject":"...","predicate":"...","object":"...","confidence":0..1}}.
+Focus on concrete technical relations (descriptor protocol, GIL, asyncio, typing, dataclass, MRO, gc, weakref).
+Text:\n{t[:3000]}
+"""
+        raw = llm.complete(prompt, strategy='cheap', json_mode=True)
+        arr = json.loads(raw) if raw else []
+        if isinstance(arr, list):
+            for x in arr[:max_triples]:
+                if not isinstance(x, dict):
+                    continue
+                s = str(x.get('subject') or '').strip()[:120]
+                p = str(x.get('predicate') or '').strip()[:120]
+                o = str(x.get('object') or '').strip()[:180]
+                c = float(x.get('confidence') or 0.6)
+                if len(s) < 2 or len(p) < 2 or len(o) < 2:
+                    continue
+                store.add_or_reinforce_triple(s, p, o, confidence=max(0.2, min(0.98, c)), note='python_deep_absorb')
+                added += 1
+    except Exception:
+        pass
+
+    # fallback lexical anchors
+    low = t.lower()
+    fallback = [
+        ('Descriptor protocol', 'defines', '__get__/__set__/__delete__ behavior'),
+        ('Python object model', 'initialization flow', '__new__ then __init__'),
+        ('CPython GIL', 'limits', 'true parallel bytecode execution in threads'),
+        ('asyncio cancellation', 'raises', 'CancelledError in cancelled tasks'),
+        ('typing.Protocol', 'supports', 'structural subtyping'),
+        ('MRO', 'uses', 'C3 linearization'),
+        ('weakref', 'helps', 'avoid strong reference cycles'),
+        ('dataclass(slots=True)', 'reduces', 'instance memory footprint'),
+    ]
+    if added == 0:
+        for s, p, o in fallback:
+            if s.split()[0].lower() in low or any(k in low for k in ['python', 'asyncio', 'typing', 'gil', 'descriptor']):
+                store.add_or_reinforce_triple(s, p, o, confidence=0.55, note='python_fallback_absorb')
+                added += 1
+                if added >= max_triples:
+                    break
+
+    return added
+
+
+def _python_benchmark_questions() -> list[dict]:
+    return [
+        {'q': 'descriptor protocol __set_name__ __get__ __set__', 'expect': ['descriptor', '__get__', '__set_name__']},
+        {'q': '__new__ vs __init__ object creation', 'expect': ['__new__', '__init__', 'instance']},
+        {'q': 'garbage collector reference cycles weakref', 'expect': ['garbage', 'cycle', 'weakref']},
+        {'q': 'asyncio cancellation CancelledError', 'expect': ['asyncio', 'cancel', 'cancellederror']},
+        {'q': 'GIL threading multiprocessing', 'expect': ['gil', 'thread', 'multiprocessing']},
+        {'q': 'contextvars vs threading.local', 'expect': ['contextvars', 'threading.local', 'context']},
+        {'q': 'dataclass frozen slots kw_only', 'expect': ['dataclass', 'frozen', 'slots']},
+        {'q': 'MRO C3 linearization super', 'expect': ['mro', 'c3', 'super']},
+        {'q': 'typing Protocol runtime_checkable structural subtyping', 'expect': ['protocol', 'runtime_checkable', 'structural']},
+        {'q': 'list comprehension versus generator expression memory', 'expect': ['list', 'generator', 'memory']},
+    ]
+
+
+async def _run_python_benchmark(top_k: int = 8) -> dict:
+    items = []
+    for it in _python_benchmark_questions():
+        q = it['q']
+        exp = it['expect']
+        try:
+            remote = await search_knowledge(q, top_k=max(3, int(top_k)))
+            local = store.search_triples(q, limit=max(5, int(top_k)))
+
+            txt_remote = ' '.join([str((x or {}).get('text') or '') if isinstance(x, dict) else str(x) for x in (remote or [])[:4]])
+            txt_local = ' '.join([
+                ' '.join([
+                    str(t.get('subject') or ''),
+                    str(t.get('predicate') or ''),
+                    str(t.get('object') or ''),
+                ]) for t in (local or [])[:10]
+            ])
+            txt = f"{txt_remote} {txt_local}".lower()
+            hits = sum(1 for k in exp if k.lower() in txt)
+            passed = ((len(remote or []) + len(local or [])) > 0) and hits >= 2
+            items.append({'query': q, 'remote_results': len(remote or []), 'local_results': len(local or []), 'keyword_hits': hits, 'pass': passed})
+        except Exception as e:
+            items.append({'query': q, 'remote_results': 0, 'local_results': 0, 'keyword_hits': 0, 'pass': False, 'error': str(e)[:120]})
+
+    passed = sum(1 for x in items if x.get('pass'))
+    score = round((passed / max(1, len(items))) * 100.0, 1)
+    out = {'passed': passed, 'total': len(items), 'score_percent': score, 'items': items}
+    store.db.add_event('python_benchmark', f"🐍 python benchmark score={score} ({passed}/{len(items)})")
+    return out
+
+
+async def _run_lightrag_general_benchmark(top_k: int = 8) -> dict:
+    suites = [
+        ('postgresql index explain analyze', ['postgresql', 'index', 'analyze']),
+        ('distributed systems idempotency retries backoff', ['idempotency', 'retry', 'backoff']),
+        ('observability tracing metrics logging correlation', ['metrics', 'tracing', 'logging']),
+        ('python descriptor protocol __set_name__', ['descriptor', '__set_name__', '__get__']),
+        ('security least privilege secret rotation', ['least privilege', 'secret', 'rotation']),
+        ('rag chunking reranking retrieval quality', ['chunk', 'rerank', 'retrieval']),
+    ]
+    items = []
+    for q, exp in suites:
+        try:
+            remote = await search_knowledge(q, top_k=max(3, int(top_k)))
+            local = store.search_triples(q, limit=max(5, int(top_k)))
+            txt_remote = ' '.join([str((x or {}).get('text') or '') if isinstance(x, dict) else str(x) for x in (remote or [])[:4]])
+            txt_local = ' '.join([' '.join([str(t.get('subject') or ''), str(t.get('predicate') or ''), str(t.get('object') or '')]) for t in (local or [])[:10]])
+            txt = f"{txt_remote} {txt_local}".lower()
+            hits = sum(1 for k in exp if k.lower() in txt)
+            ok = ((len(remote or []) + len(local or [])) > 0) and hits >= 2
+            items.append({'query': q, 'remote_results': len(remote or []), 'local_results': len(local or []), 'keyword_hits': hits, 'pass': ok})
+        except Exception as e:
+            items.append({'query': q, 'remote_results': 0, 'local_results': 0, 'keyword_hits': 0, 'pass': False, 'error': str(e)[:120]})
+
+    passed = sum(1 for x in items if x.get('pass'))
+    score = round((passed / max(1, len(items))) * 100.0, 1)
+    out = {'passed': passed, 'total': len(items), 'score_percent': score, 'items': items}
+    store.db.add_event('lightrag_benchmark', f"📚 lightrag benchmark score={score} ({passed}/{len(items)})")
+    return out
+
+
 def _horizon_review_tick() -> dict:
     roll = longhorizon.rollover_if_due()
     mission = longhorizon.active_mission()
@@ -1147,6 +1396,37 @@ def _metacognition_tick() -> dict:
     }
     _workspace_publish("metacognition", "metacog.snapshot", out, salience=0.75 if quality < 0.3 else 0.45, ttl_sec=900)
     return out
+
+
+def _self_model_refresh() -> dict:
+    st = store.db.stats()
+    caps = [
+        'Goal-first planning',
+        'System-2 deliberation with RL orchestration',
+        'Long-horizon mission continuity',
+        'Project management cycle with recovery playbooks',
+        'Tool routing with fallback chains',
+        'Neuro-symbolic proofs and consistency checks',
+        'Integrity gate (dual-consensus)',
+        'LightRAG absorption and benchmark routines',
+    ]
+    lims = [
+        'Cannot guarantee truth beyond available evidence',
+        'May fail under poor retrieval quality from external KB',
+        'Critical actions constrained by policy/causal/integrity guardrails',
+    ]
+    tools = [
+        'policy.py', 'causal precheck', 'neurosym proofs', 'project kernel', 'itc', 'tool router', 'integrity', 'LightRAG bridge'
+    ]
+    notes = [
+        f"experiences={int(st.get('experiences') or 0)}",
+        f"triples={int(st.get('triples') or 0)}",
+        f"questions_open={int(st.get('questions_open') or 0)}",
+    ]
+    sm = self_model.refresh_from_runtime(st, capabilities=caps, limits=lims, tooling=tools, notes=notes)
+    _workspace_publish('self_model', 'self.biography', sm, salience=0.72, ttl_sec=7200)
+    store.db.add_event('self_model_refresh', '🪞 self-model atualizado (biografia/capacidades/limites).')
+    return sm
 
 
 def _self_awareness_snapshot() -> dict:
@@ -2211,6 +2491,23 @@ async def _execute_next_action() -> dict | None:
         elif kind == "project_experiment_cycle":
             info = _project_experiment_cycle()
             store.db.add_event("action_done", f"🤖 ação #{aid}: project_experiment_cycle status={info.get('status')}")
+        elif kind == "absorb_lightrag_general":
+            info = await _absorb_lightrag_general(
+                max_topics=int((meta or {}).get('max_topics') or 20),
+                doc_limit=int((meta or {}).get('doc_limit') or 16),
+                domains=str((meta or {}).get('domains') or 'python,systems,database,ai'),
+            )
+            store.db.add_event("action_done", f"🤖 ação #{aid}: absorb_lightrag_general added={info.get('added_experiences')}")
+        elif kind == "self_model_refresh":
+            info = _self_model_refresh()
+            store.db.add_event("action_done", f"🤖 ação #{aid}: self_model_refresh caps={len(info.get('capabilities') or [])}")
+        elif kind == "execute_python_sandbox":
+            info = env_tools.run_python(
+                code=(meta or {}).get('code'),
+                file_path=(meta or {}).get('file_path'),
+                timeout_sec=int((meta or {}).get('timeout_sec') or 15),
+            )
+            store.db.add_event("action_done", f"🤖 ação #{aid}: execute_python_sandbox ok={info.get('ok')} rc={info.get('returncode')}")
         else:
             store.db.add_event("action_skipped", f"↷ ação #{aid} desconhecida: {kind}")
 
@@ -2357,6 +2654,21 @@ async def autonomy_loop():
                 "(ação-projeto) Rodar experimento técnico e validar hipótese de melhoria.",
                 priority=5,
                 ttl_sec=45 * 60,
+            )
+
+            _enqueue_action_if_new(
+                "self_model_refresh",
+                "(ação-self) Atualizar auto-modelo persistente (biografia/capacidades/limites).",
+                priority=4,
+                ttl_sec=60 * 60,
+            )
+
+            _enqueue_action_if_new(
+                "absorb_lightrag_general",
+                "(ação-knowledge) Absorver conhecimento do LightRAG com profundidade (multi-domínio).",
+                priority=4,
+                meta={'max_topics': 18, 'doc_limit': 12, 'domains': 'python,systems,database,ai'},
+                ttl_sec=50 * 60,
             )
 
             # Sprint 3: clarificação semântica ativa (ambiguidade/metáfora/ironia)
@@ -2973,6 +3285,39 @@ async def self_awareness_status():
     return _self_awareness_snapshot()
 
 
+@app.get('/api/self-model/status')
+async def self_model_status():
+    return self_model.load()
+
+
+@app.post('/api/self-model/refresh')
+async def self_model_refresh():
+    return _self_model_refresh()
+
+
+@app.get('/api/persona/status')
+async def persona_status():
+    return persona.status()
+
+
+@app.get('/api/persona/examples')
+async def persona_examples(limit: int = 30):
+    return {'items': persona.list_examples(limit=limit)}
+
+
+@app.post('/api/persona/examples')
+async def persona_add_example(req: PersonaExampleRequest):
+    item = persona.add_example(req.user_input, req.assistant_output, tone=req.tone, tags=req.tags or [], score=req.score)
+    store.db.add_event('persona_example', f"🎭 exemplo de estilo adicionado: {item.get('id')} tone={item.get('tone')}")
+    return item
+
+
+@app.post('/api/persona/config')
+async def persona_config(req: PersonaConfigRequest):
+    cfg = persona.save_config(req.config or {})
+    return {'status': 'ok', 'config': cfg}
+
+
 @app.get("/api/tom/status")
 async def tom_status(limit: int = 20):
     recent = store.db.list_experiences(limit=max(5, min(100, int(limit))))
@@ -3196,6 +3541,51 @@ async def projects_experiments(project_id: str, limit: int = 30):
 @app.post('/api/projects/experiments/run')
 async def projects_experiment_run():
     return _project_experiment_cycle()
+
+
+@app.post('/api/lightrag/absorb')
+async def lightrag_absorb(max_topics: int = 24, doc_limit: int = 24, domains: str = 'python,systems,database,ai'):
+    return await _absorb_lightrag_general(max_topics=max_topics, doc_limit=doc_limit, domains=domains)
+
+
+@app.post('/api/python/absorb')
+async def python_absorb(max_topics: int = 24, doc_limit: int = 24):
+    return await _absorb_python_from_lightrag(max_topics=max_topics, doc_limit=doc_limit)
+
+
+@app.get('/api/benchmark/python')
+async def benchmark_python(top_k: int = 8):
+    return await _run_python_benchmark(top_k=top_k)
+
+
+@app.get('/api/benchmark/lightrag')
+async def benchmark_lightrag(top_k: int = 8):
+    return await _run_lightrag_general_benchmark(top_k=top_k)
+
+
+@app.post('/api/sandbox/write')
+async def sandbox_write(req: SandboxWriteRequest):
+    return env_tools.write_file(req.path, req.content)
+
+
+@app.get('/api/sandbox/read')
+async def sandbox_read(path: str):
+    return env_tools.read_file(path)
+
+
+@app.get('/api/sandbox/files')
+async def sandbox_files(limit: int = 100):
+    return env_tools.list_files(limit=limit)
+
+
+@app.post('/api/sandbox/run-python')
+async def sandbox_run_python(req: SandboxRunRequest):
+    return env_tools.run_python(code=req.code, file_path=req.file_path, timeout_sec=req.timeout_sec)
+
+
+@app.get('/api/sandbox/history')
+async def sandbox_history(limit: int = 50):
+    return env_tools.history(limit=limit)
 
 
 @app.post('/api/tool-router/plan')

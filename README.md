@@ -1,173 +1,244 @@
 # UltronPRO
 
-UltronPRO é um backend+frontend para evolução incremental de uma AGI orientada por:
-- ingestão contínua de experiências,
-- grafo de conhecimento (triplas + evidências),
-- curiosidade ativa,
-- detecção/gestão de conflitos,
-- autonomia com guardrails.
+UltronPRO é uma arquitetura de agente cognitivo autônomo com foco em:
+- aprendizado contínuo,
+- planejamento orientado por objetivos,
+- execução segura com guardrails simbólicos,
+- operação de longo horizonte (horas/dias/semanas).
 
-Base conceitual: `/root/.openclaw/agi.md`.
-
----
-
-## Estado atual (fases)
-A fase exibida no frontend é dinâmica e baseada no `AGI mode`:
-- Fase 1 (Bebê): < 35%
-- Fase 2 (Criança): 35–54.9%
-- Fase 3 (Adolescente): 55–74.9%
-- Fase 4 (Adulta): >= 75%
-
-`AGI mode` é calculado por pilares (learning, curiosity, autonomy, synthesis, goals, curation).
+> Base conceitual: `/root/.openclaw/agi.md`
 
 ---
 
-## Principais capacidades implementadas
+## Visão geral da arquitetura
 
-### 1) Conhecimento + Curiosidade Adaptativa
-- Ingestão de texto/arquivo.
-- Extração de triplas via LLM + fallback regex.
-- Curiosidade com templates adaptativos + feedback de eficácia.
-- Fila adaptativa de perguntas com metadados (`template_id`, `concept`).
-- Refresh com alvo dinâmico (evita spam de perguntas abertas).
+UltronPRO combina quatro camadas principais:
 
-### 2) Conflitos (tese ↔ antítese ↔ síntese)
-- Persistência e priorização de conflitos.
-- Priorização por persistência + impacto no grafo.
-- Auto-resolução com score ponderado por:
-  - confiança da LLM,
-  - trust da fonte,
-  - coerência global.
-- Escalonamento humano para conflitos críticos.
-- Auditoria via endpoint dedicado.
+1. **Percepção/Aprendizado (neural)**
+   - ingestão de experiências,
+   - extração semântica,
+   - generalização por LLM,
+   - deliberação System-2 (ITC).
 
-### 3) Memória
-- Curadoria com clusters semânticos simples (baixo custo).
-- Memória destilada (`modality=distilled`).
-- Esquecimento ativo de baixa utilidade (`archived_at`, `utility_score`).
-- Prune goal-aware (preserva conteúdo relacionado ao objetivo ativo).
+2. **Estrutura simbólica**
+   - triplas e evidências,
+   - conflitos tese↔antítese↔síntese,
+   - regras/normas,
+   - world model causal.
 
-### 4) Procedural Learning (não-declarativo)
-- Tabelas `procedures` e `procedure_runs`.
-- Aprendizado de procedimentos por observação (`/api/procedures/learn`).
-- Seleção contextual de procedimento (`/api/procedures/select`).
-- Execução simulada e execução ativa com artefatos locais.
-- Métricas de habilidade por procedimento: tentativas, sucesso, score médio.
+3. **Agência/autonomia**
+   - fila de ações com prioridade/cooldown/TTL,
+   - goals, milestones, subgoals (DAG),
+   - project kernel com recuperação de falhas,
+   - roteamento de ferramentas com fallback.
 
-### 5) Transferência por Analogia (cross-domain)
-- Módulo dedicado `analogy.py`.
-- Geração de hipótese analógica + validação + aplicação.
-- Persistência em `analogies` com status (`hypothesis/accepted/rejected`).
-- Integração no planner/autonomia para conflitos persistentes.
-
-### 6) Global Workspace + Metacognição
-- Workspace global (`global_workspace`) para broadcast entre módulos.
-- Publicação/consumo por canais de saliência (`metacog.snapshot`, `conflict.status`, `analogy.transfer`, `procedure.execution`, `self.state`).
-- `decision_quality`, `stuck_cycles`, `replans`, `quality_history`.
-- Anti-loop por baixa qualidade contínua + replanejamento automático.
-
-### 7) Self-awareness funcional (limite técnico atual)
-- Endpoint `/api/self-awareness/status` com auto-relato operacional.
-- Proxy fenomenológico computacional (valence/arousal/control).
-- **Nota importante:** isso não prova qualia fenomenológica real; é autoconsciência funcional baseada em self-model.
-
-### 8) Executor externo seguro (Etapa E)
-- Allowlist de ações externas.
-- Dry-run.
-- `reason` obrigatório para execução real.
-- Two-phase commit (`prepare` -> `confirm_token` -> `execute`).
-- Auditoria com hash encadeado.
-
-### 9) Benchmark + Replay (Etapa F)
-- Benchmark com cenários fixos.
-- Histórico de benchmark (trend).
-- Replay orientado por severidade de falhas.
+4. **Segurança e governança**
+   - policy guardrails,
+   - causal precheck,
+   - integrity gate (consenso neural+simbólico),
+   - auditoria neuro-simbólica (proofs).
 
 ---
 
-## Rodando local (dev)
+## Capacidades implementadas (detalhado)
+
+## 1) Conhecimento, memória e curiosidade
+- Ingestão de texto e arquivos.
+- Extração de triplas (LLM + fallback).
+- Curiosidade ativa com fila adaptativa de perguntas.
+- Curadoria de memória e destilação semântica.
+- Esquecimento ativo de baixa utilidade.
+- Memória por projeto (`project_memory_index.json`).
+
+## 2) Conflitos e síntese
+- Detecção/persistência de conflitos no grafo.
+- Priorização de conflitos persistentes.
+- Auto-resolução com evidência + confiança.
+- Estratégias de improviso para conflitos travados.
+- Escalonamento para revisão humana quando necessário.
+
+## 3) Goals proativos (Impulso de Vida)
+- Goal-first planner (quando não há emergência).
+- Milestones semanais e progressão incremental.
+- Geração de ações orientadas ao objetivo ativo.
+- Ações proativas de busca (ex.: absorção no LightRAG por domínio do objetivo).
+
+## 4) Sub-objetivos e planejamento hierárquico
+- DAG de subgoals persistente (`subgoal_dag.json`).
+- Decomposição automática de meta em nós dependentes.
+- Marcação de estado por nó (`open/active/done`).
+
+## 5) System-2 / Inference-Time Compute
+- Episódios deliberativos multi-step.
+- Verificação de subresultado por passo.
+- Correção autônoma quando passo falha.
+- Orquestração com RL leve (bandit epsilon-greedy).
+- Métricas de reward/qualidade/latência por episódio.
+
+## 6) Long-horizon + Project management
+- Missões de longo horizonte com checkpoints.
+- Project kernel com KPI e blockers.
+- Recovery playbooks (timeout, tool_failure, stalemate, regressão KPI).
+- Cadência de gestão (`project_management_cycle`) com próximos passos automáticos.
+- Ciclo experimental técnico (`project_experiment_cycle`) para validação de hipótese.
+
+## 7) Ferramentas de ambiente (sandbox)
+- Escrita/leitura/listagem de arquivos em sandbox (`/app/data/sandbox`).
+- Execução real de código Python com timeout (`python3 -I`).
+- Histórico de execuções.
+
+## 8) LightRAG absorption (multi-domínio)
+- Absorção geral do LightRAG por domínios (`python, systems, database, ai`, etc.).
+- Ingestão no Ultron + tentativa de extração para grafo local.
+- Benchmarks dedicados:
+  - `/api/benchmark/python`
+  - `/api/benchmark/lightrag`
+
+## 9) Neuroplasticidade controlada
+- Proposta → shadow eval → ativação/reversão.
+- Auto-promote por gate rolling.
+- Auto-revert por degradação ou falta de ganho sustentado (7/14 dias).
+- Canary rollout por `canary_ratio`.
+
+## 10) Neuro-simbólico e explicabilidade
+- Proof objects por decisão crítica (`neurosym_proofs.json`).
+- Consistency checker simbólico.
+- Fidelity score (explicação vs ação executada).
+
+## 11) Integrity Gate V1
+- Regras rígidas de integridade (`integrity_rules.json`).
+- Estado de vetos e prevenção de alucinação (`integrity_state.json`).
+- Consenso dual:
+  - confiança deliberativa (neural)
+  - consistência simbólica
+  - prova exigida em ações críticas
+  - causal precheck quando obrigatório
+
+## 12) Auto-modelo e personalidade runtime
+- Auto-biografia persistente (`self_model.json`).
+- Personalidade dinâmica em runtime (valence/arousal/goal/purpose).
+- Few-shot dinâmico com exemplos de estilo (`persona_examples.json`).
+- Injeção automática no system prompt antes de cada chamada LLM.
+
+---
+
+## Frontend (UI)
+
+A UI inclui:
+- overview operacional,
+- feed em tempo real (SSE),
+- grafo de conhecimento,
+- conflitos, curiosidade, insights,
+- missões de longo horizonte,
+- persona runtime.
+
+### Otimizações de performance
+- polling adaptativo por visibilidade da aba,
+- limites de itens no feed DOM,
+- limites de nós/arestas no grafo,
+- timeouts e cache para endpoints lentos,
+- preview de conflitos no overview (sem precisar abrir aba de conflitos).
+
+---
+
+## Segurança e governança
+
+- Policy-based action filtering.
+- Causal precheck para ações sensíveis.
+- Integrity veto para decisões inseguras/incoerentes.
+- Auditoria com eventos e provas neuro-simbólicas.
+- Execução externa controlada (prepare/confirm/execute).
+
+---
+
+## Deploy e dados
+
+## Execução local (dev)
 ```bash
 cd backend
 python3 -m venv .venv
-. .venv/bin/activate
+source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn ultronpro.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-UI: http://localhost:8000/
+UI: `http://localhost:8000`
 
----
-
-## Deploy (Docker Swarm + Traefik)
+## Deploy (Swarm)
 Arquivos em `deploy/`.
 
-Dados persistidos em `/app/data` (SQLite, settings, benchmark history etc.).
+Dados persistidos em `/app/data` (SQLite + estados cognitivos + benchmarks + persona + sandbox).
 
 ---
 
-## Endpoints-chave (resumo)
+## Endpoints principais (resumo)
 
-### Status
+## Núcleo
 - `GET /api/status`
 - `GET /api/agi-mode`
-
-### Autonomia / Metacognição / Self-model
-- `GET /api/autonomy/status`
 - `POST /api/autonomy/tick`
-- `GET /api/metacognition/status`
-- `GET /api/self-awareness/status`
-- `POST /api/workspace/publish`
-- `GET /api/workspace/read`
 
-### Memória
-- `GET /api/memory/status`
-- `GET /api/memory/curation/status`
-- `POST /api/memory/curation/run`
-- `POST /api/memory/prune/run`
-
-### Conflitos
-- `GET /api/conflicts`
-- `GET /api/conflicts/{id}`
-- `GET /api/conflicts-prioritized`
-- `POST /api/conflicts/synthesis/run`
-- `POST /api/conflicts/auto-resolve`
-- `GET /api/conflicts-audit`
-
-### Objetivos
+## Goals / Subgoals / Missões / Projetos
 - `GET /api/goals`
 - `POST /api/goals/refresh`
-- `POST /api/goals/{id}/activate`
-- `POST /api/goals/{id}/done`
+- `POST /api/subgoals/plan`
+- `GET /api/subgoals`
+- `POST /api/horizon/missions`
+- `GET /api/horizon/missions`
+- `POST /api/projects`
+- `GET /api/projects`
+- `POST /api/projects/tick`
+- `GET /api/projects/{project_id}/brief`
 
-### Curiosidade Adaptativa
-- `POST /api/curiosity/refresh`
-- `GET /api/curiosity/stats`
-- `GET /api/curiosity/queue`
+## LLM/Reasoning
+- `POST /api/itc/run`
+- `GET /api/itc/status`
+- `GET /api/itc/policy`
 
-### Procedural Learning
-- `GET /api/procedures`
-- `POST /api/procedures/learn`
-- `POST /api/procedures/select`
-- `POST /api/procedures/execute`
-- `POST /api/procedures/execute-active`
-- `POST /api/procedures/run-log`
+## Knowledge / LightRAG
+- `POST /api/lightrag/absorb`
+- `POST /api/python/absorb`
+- `GET /api/benchmark/python`
+- `GET /api/benchmark/lightrag`
 
-### Transferência por Analogia
-- `POST /api/analogy/transfer`
-- `GET /api/analogies`
+## Conflitos
+- `GET /api/conflicts`
+- `POST /api/conflicts/auto-resolve`
 
-### Executor Externo Seguro
-- `POST /api/actions/prepare`
-- `POST /api/actions/execute`
+## Neuro-simbólico / Integridade
+- `GET /api/neurosym/proofs`
+- `GET /api/neurosym/consistency`
+- `GET /api/neurosym/fidelity`
+- `GET /api/integrity/status`
+- `POST /api/integrity/rules`
 
-### Benchmark/Replay
-- `POST /api/agi/benchmark/run`
-- `GET /api/agi/benchmark/status`
-- `GET /api/agi/benchmark/trend`
-- `POST /api/learning/replay/run`
+## Sandbox
+- `POST /api/sandbox/write`
+- `GET /api/sandbox/read`
+- `GET /api/sandbox/files`
+- `POST /api/sandbox/run-python`
+- `GET /api/sandbox/history`
+
+## Persona / Self-model
+- `GET /api/self-model/status`
+- `POST /api/self-model/refresh`
+- `GET /api/persona/status`
+- `GET /api/persona/examples`
+- `POST /api/persona/examples`
+- `POST /api/persona/config`
 
 ---
 
-## Observações
-- O sistema foi otimizado para evoluir sem estourar recursos da VPS.
-- Federated learning permanece fora do escopo atual (fase posterior).
+## Limites atuais
+
+- A qualidade final de respostas depende da qualidade/estrutura da base LightRAG.
+- O sistema é robusto, mas não substitui revisão humana em operações críticas.
+- “Autoconsciência” é funcional/operacional, não evidência de qualia fenomenológica.
+
+---
+
+## Roadmap curto sugerido
+- Painéis de observabilidade para Integrity/Router/ProjectOps.
+- Benchmark contínuo por domínio com metas de cobertura.
+- Melhor parser estruturado para ingestão de entidades/relacionamentos do LightRAG.
+- Hardening adicional da sandbox (cgroups/seccomp/import policy).

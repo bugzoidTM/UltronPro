@@ -14,10 +14,11 @@ class ProposedAction:
 
 
 def propose_actions(store) -> list[ProposedAction]:
-    """Hybrid planner: Deterministic + LLM Improvisation.
+    """Hybrid planner with Life-Drive:
 
-    1. Deterministic: routine maintenance (curiosity, basic conflict polling).
-    2. LLM: "Improvise" strategies for stubborn conflicts.
+    1. Goal-first (when not emergency): inject active goals and generate proactive actions.
+    2. Deterministic maintenance (curiosity/laws/conflicts).
+    3. LLM improvisation (conflicts + goal strategies).
     """
     actions: list[ProposedAction] = []
 
@@ -26,6 +27,67 @@ def propose_actions(store) -> list[ProposedAction]:
     intent = tom.infer_user_intent(recent_exp)
     ilabel = intent.get('label')
     iconf = float(intent.get('confidence') or 0.0)
+
+    emergency = (ilabel == 'urgent' and iconf >= 0.5)
+
+    # Impulso de Vida: objetivo ativo injeta direção proativa quando não há emergência
+    active_goal = None
+    try:
+        active_goal = store.get_active_goal()
+    except Exception:
+        active_goal = None
+
+    if active_goal and not emergency:
+        gtitle = str(active_goal.get('title') or '').strip()
+        gdesc = str(active_goal.get('description') or '').strip()
+        gtxt = f"{gtitle} {gdesc}".lower()
+
+        # ações proativas determinísticas orientadas ao objetivo
+        if any(k in gtxt for k in ['python', 'program', 'codigo', 'código']):
+            actions.append(
+                ProposedAction(
+                    kind='absorb_lightrag_general',
+                    text='(impulso-vida) Absorver conhecimento Python no LightRAG para avançar objetivo ativo.',
+                    priority=9,
+                    meta={'domains': 'python', 'max_topics': 20, 'doc_limit': 12, 'goal_id': active_goal.get('id')},
+                )
+            )
+            actions.append(
+                ProposedAction(
+                    kind='ask_evidence',
+                    text='(impulso-vida) Pesquisar no LightRAG tópicos críticos de Python ligados ao objetivo ativo e sintetizar plano de estudo/execução.',
+                    priority=8,
+                    meta={'goal_id': active_goal.get('id'), 'goal_title': gtitle},
+                )
+            )
+        else:
+            actions.append(
+                ProposedAction(
+                    kind='ask_evidence',
+                    text=f"(impulso-vida) Próximo passo objetivo para avançar '{gtitle}' com menor custo e evidência verificável.",
+                    priority=8,
+                    meta={'goal_id': active_goal.get('id'), 'goal_title': gtitle},
+                )
+            )
+
+        # improvisação LLM guiada por objetivo (não só conflito)
+        try:
+            prompt = f"""Objetivo ativo: {gtitle}\nDescrição: {gdesc}\n
+Proponha UMA ação proativa de alto impacto para avançar o objetivo hoje,
+com foco em busca de conhecimento e verificação factual.
+Responda APENAS com uma frase imperativa."""
+            strat = llm.complete(prompt, system='Você é um planner proativo orientado por objetivos.')
+            if strat:
+                actions.append(
+                    ProposedAction(
+                        kind='ask_evidence',
+                        text=f"🧭 Estratégia Pró-Objetivo: {strat}",
+                        priority=8,
+                        meta={'goal_id': active_goal.get('id'), 'strategy': 'goal_improv'},
+                    )
+                )
+        except Exception:
+            pass
 
     if ilabel == 'confused':
         actions.append(
@@ -65,9 +127,10 @@ def propose_actions(store) -> list[ProposedAction]:
         )
 
     # 1) Conflicts: keep collecting evidence / clarification
-    # We fetch a few open conflicts
+    # Goal-first policy: when no emergency and active goal exists, conflicts are handled but with lower priority.
     conflicts = store.list_conflicts(status='open', limit=10)
-    
+    conflict_base_priority = 4 if (active_goal and not emergency) else 6
+
     for c in conflicts:
         seen = int(c.get('seen_count') or 0)
         qc = int(c.get('question_count') or 0)
@@ -90,7 +153,7 @@ Responda APENAS com a ação sugerida (uma frase imperativa)."""
                     ProposedAction(
                         kind='ask_evidence',
                         text=f"🧠 Estratégia Improvisada: {strategy}",
-                        priority=8, # High priority
+                        priority=max(5, conflict_base_priority + 1),
                         meta={"conflict_id": cid, "strategy": "llm_improv"},
                     )
                 )
@@ -101,7 +164,7 @@ Responda APENAS com a ação sugerida (uma frase imperativa)."""
                 ProposedAction(
                     kind='ask_evidence',
                     text=f"(ação) Coletar evidências: qual é a formulação correta para '{subj}' {pred}? Forneça fonte/experimento/definição.",
-                    priority=5,
+                    priority=conflict_base_priority,
                     meta={"conflict_id": cid},
                 )
             )
@@ -113,7 +176,7 @@ Responda APENAS com a ação sugerida (uma frase imperativa)."""
                     ProposedAction(
                         kind='generate_analogy_hypothesis',
                         text=f"(ação) Tentar analogia estrutural para resolver conflito: {subj} {pred}",
-                        priority=6,
+                        priority=max(5, conflict_base_priority + 1),
                         meta={"conflict_id": cid, "problem_text": q, "target_domain": str(pred)},
                     )
                 )
